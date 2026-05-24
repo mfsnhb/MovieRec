@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Literal, Mapping
@@ -177,14 +176,3 @@ def normalize_ids(df: pd.DataFrame, columns: Iterable[str]) -> pd.DataFrame:
         df[col] = df[col].map(clean_value)
     return df
 
-
-def split_users(user_ids: list[str], valid_ratio: float, test_ratio: float, seed: int) -> dict[str, str]:
-    shuffled = user_ids[:]
-    rng = random.Random(seed)
-    rng.shuffle(shuffled)
-    n_total = len(shuffled)
-    n_test = int(n_total * test_ratio)
-    n_valid = int(n_total * valid_ratio)
-    test_users = set(shuffled[:n_test])
-    valid_users = set(shuffled[n_test : n_test + n_valid])
-    return {user_id: "test" if user_id in test_users else "valid" if user_id in valid_users else "train" for user_id in user_ids}

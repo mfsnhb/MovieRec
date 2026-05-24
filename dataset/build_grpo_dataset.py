@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import random
 import shutil
 from collections import Counter
 from pathlib import Path
@@ -12,13 +11,13 @@ from utils.data_io import (
     clean_value,
     load_id_inputs,
     movie_token,
-    split_users,
 )
 from dataset.sft_schema import (
     ID_ONLY_SUFFIX,
     format_id_interaction_history,
     format_user_profile,
 )
+from dataset.build_sft_dataset import LEAVE_ONE_OUT_SPLITS, loo_targets
 from utils.training_utils import ensure_dir, save_json
 
 
@@ -32,9 +31,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, default=Path("data/processed/grpo_movielens_1m"))
     parser.add_argument("--min-history", type=int, default=3)
     parser.add_argument("--max-history", type=int, default=30)
-    parser.add_argument("--valid-ratio", type=float, default=0.05)
-    parser.add_argument("--test-ratio", type=float, default=0.10)
-    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-users", type=int)
     parser.add_argument("--movie-token-format", choices=["angle", "plain"], default="angle")
     parser.add_argument("--overwrite", action="store_true")
@@ -79,8 +75,6 @@ def main() -> None:
 
     movie_features, users, ratings_df = load_id_inputs(args.raw_dir)
     user_ids = list(ratings_df["user_id"].drop_duplicates())
-    user_split = split_users(user_ids, args.valid_ratio, args.test_ratio, args.seed)
-    rng = random.Random(args.seed)
 
     outputs: dict[str, list[dict[str, Any]]] = {"train": [], "valid": [], "test": []}
     grouped = ratings_df.groupby("user_id", sort=False)
@@ -92,22 +86,20 @@ def main() -> None:
         records = user_ratings.to_dict("records")
         if len(records) <= args.min_history:
             continue
-        target_pos = rng.randrange(args.min_history, len(records)) if user_split[user_id] == "train" else len(records) - 1
-        history = records[max(0, target_pos - args.max_history) : target_pos]
-        target = records[target_pos]
-        target_movie_id = clean_value(target["movie_id"])
-        split = user_split[user_id]
-        outputs[split].append(
-            {
-                "id": f"grpo:user_{user_id}:pos_{target_pos}",
-                "split": split,
-                "prompt": build_prompt(users.get(user_id), history, args.movie_token_format),
-                "target_movie_id": movie_token(target_movie_id, args.movie_token_format),
-                "history_movie_ids": [movie_token(event["movie_id"], args.movie_token_format) for event in history],
-                "candidate_movie_ids": None,
-                "source": SOURCE,
-            }
-        )
+        for split, target_pos, history, target in loo_targets(records, args.min_history, args.max_history):
+            target_movie_id = clean_value(target["movie_id"])
+            outputs[split].append(
+                {
+                    "id": f"grpo:user_{user_id}:loo_{split}:pos_{target_pos}",
+                    "split": split,
+                    "prompt": build_prompt(users.get(user_id), history, args.movie_token_format),
+                    "target_movie_id": movie_token(target_movie_id, args.movie_token_format),
+                    "history_movie_ids": [movie_token(event["movie_id"], args.movie_token_format) for event in history],
+                    "history_timestamps": [event["timestamp"] for event in history],
+                    "candidate_movie_ids": None,
+                    "source": SOURCE,
+                }
+            )
 
     counts = Counter({split: len(records) for split, records in outputs.items()})
     for split, records in outputs.items():
@@ -120,6 +112,8 @@ def main() -> None:
             "min_history": args.min_history,
             "max_history": args.max_history,
             "movie_token_format": args.movie_token_format,
+            "sequence_split_protocol": "leave_one_out",
+            "leave_one_out_splits": {split: f"target is the {offset} item from the end" for split, offset in LEAVE_ONE_OUT_SPLITS},
             "splits": dict(counts),
             "num_users": len(user_ids),
             "num_movies": len(movie_features),

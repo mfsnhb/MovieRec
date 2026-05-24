@@ -19,6 +19,7 @@ class ModelConfig:
     bnb_4bit_quant_type: str = "nf4"
     bnb_4bit_compute_dtype: str = "bfloat16"
     trust_remote_code: bool = True
+    attn_implementation: str | None = None
 
 
 def torch_dtype(dtype: str) -> torch.dtype:
@@ -87,12 +88,14 @@ def load_tokenizer(
 
 
 def load_causal_lm(config: ModelConfig, tokenizer=None):
-    model = AutoModelForCausalLM.from_pretrained(
-        config.model_name_or_path,
-        quantization_config=build_quantization_config(config),
-        device_map="auto",
-        trust_remote_code=config.trust_remote_code,
-    )
+    kwargs = {
+        "quantization_config": build_quantization_config(config),
+        "device_map": "auto",
+        "trust_remote_code": config.trust_remote_code,
+    }
+    if config.attn_implementation:
+        kwargs["attn_implementation"] = config.attn_implementation
+    model = AutoModelForCausalLM.from_pretrained(config.model_name_or_path, **kwargs)
     if tokenizer is not None and len(tokenizer) != model.get_input_embeddings().weight.shape[0]:
         model.resize_token_embeddings(len(tokenizer))
     model.config.use_cache = False

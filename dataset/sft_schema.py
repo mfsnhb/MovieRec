@@ -28,37 +28,61 @@ ID_ONLY_SUFFIX = "Answer with exactly one MovieLens ID and no other words."
 
 PROMPT_TEMPLATES = {
     "NextMoviePrediction": [
-        """Here is a user's recent movie-watching history. Each line says that the user gave a MovieLens ID a rating at a specific time:
+        """User profile:
+{user_profile}
+
+Here is the user's recent movie-watching history. Each line says that the user gave a MovieLens ID a rating at a specific time:
 {history}
 
-Based on this chronological rating history, recommend the movie ID the user is most likely to watch next. {id_only_suffix}""",
-        """A user has the following chronological interaction log. Each line means the user gave the MovieLens ID a rating at that timestamp:
+Based on this profile and chronological rating history, recommend the movie ID the user is most likely to watch next. {id_only_suffix}""",
+        """The user can be described as follows:
+{user_profile}
+
+The user has the following chronological interaction log. Each line means the user gave the MovieLens ID a rating at that timestamp:
 {history}
 
-Use this sequence to predict the next movie. {id_only_suffix}""",
-        """The following records summarize that the user rated each MovieLens ID at the shown timestamp:
+Use this profile and sequence to predict the next movie. {id_only_suffix}""",
+        """Profile:
+{user_profile}
+
+The following records summarize that the user rated each MovieLens ID at the shown timestamp:
 {history}
 
 What MovieLens ID should come next for this user? {id_only_suffix}""",
-        """Consider this user's recent viewing sequence. Each line says when the user rated a MovieLens ID and how many stars they gave it:
+        """Consider this user's profile:
+{user_profile}
+
+Their recent viewing sequence is below. Each line says when the user rated a MovieLens ID and how many stars they gave it:
 {history}
 
-Please infer the next likely MovieLens item from when the user rated each Movie ID and how much they liked it. {id_only_suffix}""",
+Please infer the next likely MovieLens item from the profile, timing, and ratings. {id_only_suffix}""",
     ],
     "Seq_ID2Title": [
-        """A user has this chronological MovieLens interaction history. Each line says that the user gave a MovieLens ID a rating at a specific time:
+        """User profile:
+{user_profile}
+
+The user has this chronological MovieLens interaction history. Each line says that the user gave a MovieLens ID a rating at a specific time:
 {history}
 
 Describe the kind of movie this user is likely to watch next. Include the title, genres, and description naturally in your answer.""",
-        """Here is a user's recent sequence of ratings. Each line says when the user rated a MovieLens ID and how many stars they gave it:
+        """The user can be described as follows:
+{user_profile}
+
+Here is the user's recent sequence of ratings. Each line says when the user rated a MovieLens ID and how many stars they gave it:
 {history}
 
 Instead of returning another ID, write a natural description of the next movie, including its title, genres, and description.""",
-        """The user's recent MovieLens history is shown below. Each line means the user gave that MovieLens ID a rating at that timestamp:
+        """Profile:
+{user_profile}
+
+The user's recent MovieLens history is shown below. Each line means the user gave that MovieLens ID a rating at that timestamp:
 {history}
 
-What movie does this sequence of dated ratings point to next? Answer in prose and include the title, genres, and description.""",
-        """Given this chronological list of MovieLens interactions, where each line records the timestamp and rating for a MovieLens ID:
+What movie does this profile and sequence of dated ratings point to next? Answer in prose and include the title, genres, and description.""",
+        """A user with this profile:
+{user_profile}
+
+has the following chronological list of MovieLens interactions, where each line records the timestamp and rating for a MovieLens ID:
 {history}
 
 Summarize the likely next movie in natural language, making sure the title, genres, and description are present.""",
@@ -218,6 +242,7 @@ def identify_movie_answer(movie_id: Any, token_format: Literal["angle", "plain"]
 
 
 def build_next_movie_prediction(
+    user: dict[str, Any] | None,
     history: list[dict[str, Any]],
     target_movie_id: str,
     token_format: Literal["angle", "plain"],
@@ -226,6 +251,7 @@ def build_next_movie_prediction(
     input_text = render_prompt_template(
         "NextMoviePrediction",
         rng,
+        user_profile=format_user_profile(user),
         history=format_id_interaction_history(history, token_format),
         id_only_suffix=ID_ONLY_SUFFIX,
     )
@@ -233,6 +259,7 @@ def build_next_movie_prediction(
 
 
 def build_seq_id_to_title(
+    user: dict[str, Any] | None,
     history: list[dict[str, Any]],
     target_movie_id: str,
     movie_features: MovieFeatureStore,
@@ -242,6 +269,7 @@ def build_seq_id_to_title(
     input_text = render_prompt_template(
         "Seq_ID2Title",
         rng,
+        user_profile=format_user_profile(user),
         history=format_id_interaction_history(history, token_format),
     )
     return RenderedExample(INSTRUCTION, input_text, movie_features.basic_text(target_movie_id))

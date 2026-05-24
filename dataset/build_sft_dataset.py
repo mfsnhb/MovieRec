@@ -32,7 +32,7 @@ from dataset.sft_schema import (
 )
 
 SOURCE = "funrec-movielens-1m"
-USER_PROFILE_TASKS = {"Seq_Title2ID"}
+USER_PROFILE_TASKS = {"NextMoviePrediction", "Seq_ID2Title", "Seq_Title2ID"}
 LEAVE_ONE_OUT_SPLITS = (
     ("train", 3),
     ("valid", 2),
@@ -138,8 +138,11 @@ def validate_record(record: dict[str, Any], valid_movie_tokens: set[str]) -> Non
             raise ValueError(f"Invalid movie ID output in {record['id']}: {record['output']}")
     if task in {"Seq_ID2Title", "Single_ID2Title", "ID2Feature"} and "description" not in record["output"].lower():
         raise ValueError(f"Description missing from textual output in {record['id']}")
-    if task in {"NextMoviePrediction", "Seq_ID2Title", "Seq_Title2ID"} and "stars" not in record["input"]:
-        raise ValueError(f"Interaction rating missing from sequence input in {record['id']}")
+    if task in {"NextMoviePrediction", "Seq_ID2Title", "Seq_Title2ID"}:
+        if "stars" not in record["input"]:
+            raise ValueError(f"Interaction rating missing from sequence input in {record['id']}")
+        if "- Gender:" not in record["input"] and "User profile is unavailable." not in record["input"]:
+            raise ValueError(f"User profile missing from sequence input in {record['id']}")
 
 
 def load_inputs(raw_dir: Path, tasks: set[str] | None = None) -> tuple[MovieFeatureStore, dict[str, dict[str, Any]], pd.DataFrame]:
@@ -236,6 +239,7 @@ def emit_sequence_tasks(
                     (
                         "NextMoviePrediction",
                         build_next_movie_prediction(
+                            users.get(user_id),
                             history,
                             target_movie_id,
                             args.movie_token_format,
@@ -247,7 +251,7 @@ def emit_sequence_tasks(
                 task_renderers.append(
                     (
                         "Seq_ID2Title",
-                        build_seq_id_to_title(history, target_movie_id, movie_features, args.movie_token_format, rng),
+                        build_seq_id_to_title(users.get(user_id), history, target_movie_id, movie_features, args.movie_token_format, rng),
                     )
                 )
             if "Seq_Title2ID" in tasks:
