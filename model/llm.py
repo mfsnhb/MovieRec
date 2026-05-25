@@ -8,6 +8,7 @@ from typing import Iterable, Literal
 import pandas as pd
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from peft import PeftModel
 
 from utils.data_io import clean_value, movie_id_sort_key, movie_token
 
@@ -48,26 +49,14 @@ def build_quantization_config(config: ModelConfig) -> BitsAndBytesConfig | None:
 
 
 def collect_movie_tokens(
-    data_dir: Path | str | None = None,
-    raw_dir: Path | str | None = None,
-    max_movie_id: int | None = None,
+    raw_dir: Path | str,
     token_format: Literal["angle", "plain"] = "angle",
 ) -> list[str]:
-    movie_ids: set[str] = set()
-    if raw_dir is not None:
-        movies_path = Path(raw_dir) / "movies.pkl"
-        if movies_path.exists():
-            movies_df = pd.read_pickle(movies_path)
-            movie_ids.update(clean_value(movie_id) for movie_id in movies_df["movie_id"].tolist())
-    if data_dir is not None:
-        stats_path = Path(data_dir) / "stats.json"
-        if stats_path.exists() and max_movie_id is None:
-            stats = json.loads(stats_path.read_text(encoding="utf-8"))
-            num_movies = stats.get("num_movies")
-            if isinstance(num_movies, int) and num_movies > 0:
-                max_movie_id = num_movies
-    if max_movie_id is not None:
-        movie_ids.update(str(movie_id) for movie_id in range(1, max_movie_id + 1))
+    movies_path = Path(raw_dir) / "movies.pkl"
+    if not movies_path.exists():
+        raise FileNotFoundError(f"Movie metadata not found: {movies_path}")
+    movies_df = pd.read_pickle(movies_path)
+    movie_ids = {clean_value(movie_id) for movie_id in movies_df["movie_id"].tolist()}
     return [movie_token(movie_id, token_format) for movie_id in sorted(movie_ids, key=movie_id_sort_key)]
 
 
@@ -87,7 +76,26 @@ def load_tokenizer(
     return tokenizer
 
 
+def adapter_base_model_path(model_name_or_path: Path | str) -> str | None:
+    adapter_config_path = Path(model_name_or_path) / "adapter_config.json"
+    if not adapter_config_path.exists():
+        return None
+    base_model_path = json.loads(adapter_config_path.read_text(encoding="utf-8")).get("base_model_name_or_path")
+    if not base_model_path:
+        return None
+    base_path = Path(base_model_path)
+    if base_path.is_absolute():
+        return str(base_path)
+    cwd_relative = Path.cwd() / base_path
+    if cwd_relative.exists():
+        return str(cwd_relative.resolve())
+    return str((adapter_config_path.parent / base_path).resolve())
+
+
 def load_causal_lm(config: ModelConfig, tokenizer=None):
+    adapter_path = Path(config.model_name_or_path)
+    base_model_path = adapter_base_model_path(adapter_path)
+    model_path = base_model_path or config.model_name_or_path
     kwargs = {
         "quantization_config": build_quantization_config(config),
         "device_map": "auto",
@@ -95,8 +103,10 @@ def load_causal_lm(config: ModelConfig, tokenizer=None):
     }
     if config.attn_implementation:
         kwargs["attn_implementation"] = config.attn_implementation
-    model = AutoModelForCausalLM.from_pretrained(config.model_name_or_path, **kwargs)
+    model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
     if tokenizer is not None and len(tokenizer) != model.get_input_embeddings().weight.shape[0]:
         model.resize_token_embeddings(len(tokenizer))
+    if base_model_path is not None:
+        model = PeftModel.from_pretrained(model, str(adapter_path))
     model.config.use_cache = False
     return model

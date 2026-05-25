@@ -144,7 +144,7 @@ def main() -> None:
     train_dataset = load_grpo_train_dataset(args.data_dir)
 
     logger("3. Load tokenizer and policy model")
-    movie_tokens = collect_movie_tokens(raw_dir=args.raw_dir) if args.movie_tokens else []
+    movie_tokens = collect_movie_tokens(args.raw_dir) if args.movie_tokens else []
     tokenizer = load_tokenizer(args.model_name_or_path, movie_tokens=movie_tokens, padding_side="left")
     model = load_causal_lm(ModelConfig(args.model_name_or_path, load_in_4bit=args.load_in_4bit), tokenizer=tokenizer)
     if args.load_in_4bit:

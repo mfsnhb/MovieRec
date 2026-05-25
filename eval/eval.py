@@ -16,7 +16,7 @@ from utils.data_io import (
 from utils.inference import (
     GenerationConfig,
     build_recommendation_prompt,
-    generate_ranked_movie_tokens,
+    generate_ranked_movie_tokens_batch,
     load_inference_components,
     prediction_record,
 )
@@ -30,16 +30,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/eval/leave_one_out"))
     parser.add_argument("--max-users", type=int)
     parser.add_argument("--min-history", type=int, default=3)
-    parser.add_argument("--max-history", type=int, default=None)
-    parser.add_argument("--max-new-tokens", type=int, default=2)
-    parser.add_argument("--num-return-sequences", type=int, default=10)
-    parser.add_argument("--num-beams", type=int, default=10)
-    parser.add_argument("--do-sample", action="store_true")
-    parser.add_argument("--temperature", type=float, default=0.7)
-    parser.add_argument("--top-p", type=float, default=0.9)
+    parser.add_argument("--max-history", type=int, default=30)
+    parser.add_argument("--top-k", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--movie-token-format", choices=["angle", "plain"], default="angle")
     parser.add_argument("--load-in-4bit", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--attn-implementation", choices=["eager", "sdpa", "flash_attention_2"])
     return parser.parse_args()
 
 
@@ -61,15 +58,9 @@ def main() -> None:
         list(movie_features.movie_ids),
         args.movie_token_format,
         args.load_in_4bit,
+        args.attn_implementation,
     )
-    generation_config = GenerationConfig(
-        max_new_tokens=args.max_new_tokens,
-        num_return_sequences=args.num_return_sequences,
-        num_beams=args.num_beams,
-        do_sample=args.do_sample,
-        temperature=args.temperature,
-        top_p=args.top_p,
-    )
+    generation_config = GenerationConfig(top_k=args.top_k)
 
     predictions_path = args.output_dir / "predictions.jsonl"
     metrics = {
@@ -83,20 +74,20 @@ def main() -> None:
 
     grouped = ratings_df.groupby("user_id", sort=False)
     with predictions_path.open("w", encoding="utf-8") as handle:
-        processed_users = 0
-        for user_id, user_ratings in tqdm(grouped, desc="leave-one-out eval"):
-            if args.max_users is not None and processed_users >= args.max_users:
-                break
-            records = user_ratings.to_dict("records")
-            if len(records) <= args.min_history:
-                continue
-            processed_users += 1
-            for split, target_pos, history, target in loo_targets(records, args.min_history, args.max_history):
-                if split != "test":
-                    continue
-                target_token = movie_token(clean_value(target["movie_id"]), args.movie_token_format)
-                prompt = build_recommendation_prompt(users.get(user_id), history, args.movie_token_format)
-                prediction = generate_ranked_movie_tokens(components, prompt, generation_config, args.movie_token_format)
+        pending: list[dict[str, object]] = []
+
+        def flush_pending() -> None:
+            if not pending:
+                return
+            predictions = generate_ranked_movie_tokens_batch(
+                components,
+                [str(item["prompt"]) for item in pending],
+                generation_config,
+                [item["history_tokens"] for item in pending],  # type: ignore[list-item]
+                token_format=args.movie_token_format,
+            )
+            for item, prediction in zip(pending, predictions, strict=True):
+                target_token = str(item["target_token"])
                 ranked = prediction["predicted_movie_ids"]
                 rank = ranked.index(target_token) + 1 if target_token in ranked else None
 
@@ -110,9 +101,9 @@ def main() -> None:
                 handle.write(
                     json.dumps(
                         prediction_record(
-                            user_id,
-                            split,
-                            target_pos,
+                            str(item["user_id"]),
+                            str(item["split"]),
+                            int(item["target_pos"]),
                             target_token,
                             prediction,
                             rank,
@@ -121,6 +112,35 @@ def main() -> None:
                     )
                     + "\n"
                 )
+            pending.clear()
+
+        processed_users = 0
+        for user_id, user_ratings in tqdm(grouped, desc="leave-one-out eval"):
+            if args.max_users is not None and processed_users >= args.max_users:
+                break
+            records = user_ratings.to_dict("records")
+            if len(records) <= args.min_history:
+                continue
+            processed_users += 1
+            for split, target_pos, history, target in loo_targets(records, args.min_history, args.max_history):
+                if split != "test":
+                    continue
+                target_token = movie_token(clean_value(target["movie_id"]), args.movie_token_format)
+                prompt = build_recommendation_prompt(users.get(user_id), history, args.movie_token_format)
+                history_tokens = {movie_token(clean_value(event["movie_id"]), args.movie_token_format) for event in history}
+                pending.append(
+                    {
+                        "user_id": user_id,
+                        "split": split,
+                        "target_pos": target_pos,
+                        "target_token": target_token,
+                        "prompt": prompt,
+                        "history_tokens": history_tokens,
+                    }
+                )
+                if len(pending) >= args.batch_size:
+                    flush_pending()
+        flush_pending()
 
     total = max(1, metrics["total"])
     normalized = {
