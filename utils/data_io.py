@@ -2,15 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Literal, Mapping
+from typing import Any, Iterable, Mapping
 
 import pandas as pd
 
 
-_MOVIE_ID_PREFIX = "movie_"
-MOVIE_ID_FEATURE_COLUMNS = frozenset({"movie_id"})
+_TITLE_FEATURE_COLUMNS = frozenset({"movie_id", "title"})
 _BASIC_TEXT_FEATURE_COLUMNS = frozenset({"movie_id", "title", "genres", "description"})
-_INTERACTION_FEATURE_COLUMNS = frozenset({"movie_id", "title", "genres"})
 _FULL_FEATURE_COLUMNS = frozenset(
     {
         "movie_id",
@@ -25,18 +23,16 @@ _FULL_FEATURE_COLUMNS = frozenset(
 )
 
 _MOVIE_FEATURE_COLUMNS_BY_TASK = {
-    "NextMoviePrediction": MOVIE_ID_FEATURE_COLUMNS,
-    "Seq_ID2Title": _BASIC_TEXT_FEATURE_COLUMNS,
-    "Seq_Title2ID": _INTERACTION_FEATURE_COLUMNS,
-    "Single_ID2Title": _BASIC_TEXT_FEATURE_COLUMNS,
-    "Single_Title2ID": _BASIC_TEXT_FEATURE_COLUMNS,
-    "ID2Feature": _FULL_FEATURE_COLUMNS,
-    "Feature2ID": _FULL_FEATURE_COLUMNS,
+    "NextMovieTitlePrediction": _TITLE_FEATURE_COLUMNS,
+    "Seq_Title2Feature": _BASIC_TEXT_FEATURE_COLUMNS,
+    "Seq_Rating": _TITLE_FEATURE_COLUMNS,
+    "Single_Title2Feature": _BASIC_TEXT_FEATURE_COLUMNS,
+    "Single_Feature2Title": _FULL_FEATURE_COLUMNS,
 }
 
 
 _DEFAULT_REQUIRED_COLUMNS = {
-    "movies.pkl": set(MOVIE_ID_FEATURE_COLUMNS),
+    "movies.pkl": {"movie_id", "title"},
     "ratings.pkl": {"user_id", "movie_id", "rating", "timestamp"},
     "users.pkl": {"user_id", "gender", "age", "occupation"},
 }
@@ -54,11 +50,6 @@ def clean_value(value: Any) -> str:
 def movie_id_sort_key(movie_id: Any) -> tuple[int, int | str]:
     text = clean_value(movie_id)
     return (0, int(text)) if text.isdigit() else (1, text)
-
-
-def movie_token(movie_id: Any, token_format: Literal["angle", "plain"] = "angle") -> str:
-    token = f"{_MOVIE_ID_PREFIX}{clean_value(movie_id)}"
-    return f"<{token}>" if token_format == "angle" else token
 
 
 def required_movie_feature_columns(tasks: Iterable[str]) -> set[str]:
@@ -106,6 +97,9 @@ class MovieFeatureStore:
     def genres(self, movie_id: Any) -> str:
         return clean_value(self.get(movie_id).get("genres")).replace("|", ", ")
 
+    def title(self, movie_id: Any) -> str:
+        return clean_value(self.get(movie_id).get("title"))
+
     def basic_text(self, movie_id: Any) -> str:
         movie = self.get(movie_id)
         return (
@@ -114,21 +108,24 @@ class MovieFeatureStore:
             f"Its description is: {clean_value(movie.get('description'))}"
         )
 
-    def interaction_text(self, movie_id: Any) -> str:
+    def feature_text(self, movie_id: Any) -> str:
         movie = self.get(movie_id)
-        return f"title: {clean_value(movie.get('title'))}; genres: {self.genres(movie_id)}"
+        return (
+            f"The genre(s) are {self.genres(movie_id)}. "
+            f"The description is: {clean_value(movie.get('description'))}"
+        )
 
     def full_feature(self, movie_id: Any) -> str:
         movie = self.get(movie_id)
         adult = clean_value(movie.get("isAdult"))
         if adult in {"1", "1.0", "True", "true"}:
-            adult_text = "adult title"
+            adult_text = "adult-oriented"
         elif adult in {"0", "0.0", "False", "false"}:
-            adult_text = "non-adult title"
+            adult_text = "not adult-oriented"
         else:
             adult_text = f"adult flag is {adult}"
         return (
-            f"{clean_value(movie.get('title'))} is a {adult_text} with genre(s) {self.genres(movie_id)}. "
+            f"This movie is {adult_text} with genre(s) {self.genres(movie_id)}. "
             f"The runtime is {clean_value(movie.get('runtimeMinutes'))} minutes, and its external average rating is "
             f"{clean_value(movie.get('averageRating'))} based on {clean_value(movie.get('numVotes'))} votes. "
             f"Description: {clean_value(movie.get('description'))}"
@@ -156,7 +153,8 @@ def load_ratings(raw_dir: Path, movie_features: MovieFeatureStore | None = None)
     ratings_df = normalize_ids(load_dataframe(raw_dir, "ratings.pkl"), ["user_id", "movie_id"])
     if movie_features is not None:
         ratings_df = ratings_df[ratings_df["movie_id"].isin(movie_features.movie_id_set)]
-    return ratings_df.sort_values(["user_id", "timestamp", "movie_id"])
+    ratings_df = ratings_df[["user_id", "movie_id", "rating", "timestamp"]].copy()
+    return ratings_df.sort_values(["user_id", "timestamp"], kind="mergesort")
 
 
 def load_user_profiles(raw_dir: Path) -> dict[str, dict[str, Any]]:
@@ -164,15 +162,7 @@ def load_user_profiles(raw_dir: Path) -> dict[str, dict[str, Any]]:
     return {row["user_id"]: row for row in users_df.to_dict("records")}
 
 
-def load_id_inputs(raw_dir: Path) -> tuple[MovieFeatureStore, dict[str, dict[str, Any]], pd.DataFrame]:
-    movie_features = load_movie_feature_store(raw_dir, set(MOVIE_ID_FEATURE_COLUMNS))
-    ratings_df = load_ratings(raw_dir, movie_features)
-    users = load_user_profiles(raw_dir)
-    return movie_features, users, ratings_df
-
-
 def normalize_ids(df: pd.DataFrame, columns: Iterable[str]) -> pd.DataFrame:
     for col in columns:
         df[col] = df[col].map(clean_value)
     return df
-

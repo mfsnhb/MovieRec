@@ -1,18 +1,14 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 from pathlib import Path
-from typing import Iterable
 
-import torch
-import torch.nn.functional as F
-from datasets import Dataset, load_dataset
+from datasets import load_dataset
 from peft import LoraConfig, prepare_model_for_kbit_training
 from trl import SFTConfig, SFTTrainer
 
-from model.llm import ModelConfig, collect_movie_tokens, load_causal_lm, load_tokenizer
+from model.llm import ModelConfig, load_causal_lm, load_tokenizer
 from utils.training_utils import Logger, ensure_dir, print_trainable_parameters, save_json, setup_seed
 
 
@@ -25,11 +21,10 @@ PROMPT_TEMPLATE = """{instruction}
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="QLoRA SFT for MovieRec Movie-ID recommendation data.")
+    parser = argparse.ArgumentParser(description="QLoRA SFT for title-based MovieRec recommendation data.")
     parser.add_argument("--model-name-or-path", default="models/Qwen3-4B")
     parser.add_argument("--data-dir", type=Path, default=Path("data/processed/sft_movielens_1m"))
-    parser.add_argument("--raw-dir", type=Path, default=Path("data/raw/funrec-movielens-1m"))
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs/sft/qwen3_4b"))
+    parser.add_argument("--output-dir", type=Path, default=Path("sft/qwen3_4b_QLoRA"))
     parser.add_argument("--max-train-examples", type=int)
     parser.add_argument("--max-seq-length", type=int, default=2048)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -46,12 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-dropout", type=float, default=0.05)
     parser.add_argument("--target-modules", default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
     parser.add_argument("--load-in-4bit", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--movie-tokens", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--packing", action="store_true")
-    parser.add_argument("--packing-strategy", choices=["bfd", "bfd_split", "wrapped"], default="bfd")
-    parser.add_argument("--movie-token-loss-weight", type=float, default=1.0)
-    parser.add_argument("--task-loss-weights", default="")
-    parser.add_argument("--default-task-loss-weight", type=float, default=1.0)
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--optim", default="paged_adamw_8bit")
@@ -77,24 +67,6 @@ def split_csv(value: str | None) -> list[str]:
     return [name.strip() for name in value.split(",") if name.strip()]
 
 
-def parse_weight_map(value: str) -> dict[str, float]:
-    weights: dict[str, float] = {}
-    if not value:
-        return weights
-    for item in value.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        if "=" not in item:
-            raise ValueError(f"Invalid task weight '{item}'. Expected TASK=WEIGHT.")
-        key, raw_weight = item.split("=", 1)
-        key = key.strip()
-        if not key:
-            raise ValueError(f"Invalid empty task name in task weights: {value}")
-        weights[key] = float(raw_weight)
-    return weights
-
-
 def load_sft_train_dataset(data_dir: Path):
     train_path = data_dir / "train.jsonl"
     if not train_path.exists():
@@ -102,229 +74,75 @@ def load_sft_train_dataset(data_dir: Path):
     return load_dataset("json", data_files=str(train_path), split="train")
 
 
-def movie_token_ids(tokenizer, movie_tokens: Iterable[str]) -> list[int]:
-    ids = tokenizer.convert_tokens_to_ids(list(movie_tokens))
-    if isinstance(ids, int):
-        ids = [ids]
-    unk_id = getattr(tokenizer, "unk_token_id", None)
-    valid_ids = []
-    for token_id in ids:
-        if token_id is None:
-            continue
-        token_id = int(token_id)
-        if unk_id is not None and token_id == unk_id:
-            continue
-        valid_ids.append(token_id)
-    return sorted(set(valid_ids))
-
-
-def ensure_eos(text: str, eos_token: str | None) -> str:
-    if not eos_token or text.endswith(eos_token):
-        return text
-    return text + eos_token
-
-
-def truncate_keep_end(record: dict[str, list], max_length: int) -> dict[str, list]:
-    if len(record["input_ids"]) <= max_length:
-        return record
-    return {key: value[-max_length:] for key, value in record.items()}
-
-
-def tokenize_weighted_example(
-    example: dict,
-    tokenizer,
-    movie_token_id_set: set[int],
-    task_weights: dict[str, float],
-    default_task_weight: float,
-    movie_token_loss_weight: float,
-    max_length: int,
-) -> dict[str, list[int] | list[float]]:
-    prompt = format_prompt(example)
-    completion = ensure_eos(str(example["output"]), tokenizer.eos_token)
-    prompt_ids = tokenizer(prompt)["input_ids"]
-    full_ids = tokenizer(prompt + completion)["input_ids"]
-    prompt_len = len(prompt_ids)
-    if full_ids[:prompt_len] != prompt_ids:
-        completion_ids = tokenizer(completion, add_special_tokens=False)["input_ids"]
-        full_ids = prompt_ids + completion_ids
-        prompt_len = len(prompt_ids)
-
-    labels = [-100] * prompt_len + full_ids[prompt_len:]
-    task_weight = float(task_weights.get(str(example["task"]), default_task_weight))
-    loss_weights = [0.0] * prompt_len
-    for token_id in full_ids[prompt_len:]:
-        weight = task_weight
-        if int(token_id) in movie_token_id_set:
-            weight *= movie_token_loss_weight
-        loss_weights.append(float(weight))
-
-    record = {
-        "input_ids": full_ids,
-        "attention_mask": [1] * len(full_ids),
-        "labels": labels,
-        "loss_weights": loss_weights,
+def to_prompt_completion(example: dict) -> dict[str, str]:
+    return {
+        "prompt": format_prompt(example),
+        "completion": str(example["output"]),
     }
-    return truncate_keep_end(record, max_length)
 
 
-def pack_weighted_records(dataset, max_length: int) -> Dataset:
-    packed: list[dict[str, list]] = []
-    current = {"input_ids": [], "attention_mask": [], "labels": [], "loss_weights": []}
-
-    def flush() -> None:
-        if current["input_ids"]:
-            packed.append({key: list(value) for key, value in current.items()})
-            for value in current.values():
-                value.clear()
-
-    for example in dataset:
-        example_length = len(example["input_ids"])
-        if current["input_ids"] and len(current["input_ids"]) + example_length > max_length:
-            flush()
-        for key in current:
-            current[key].extend(example[key])
-    flush()
-    return Dataset.from_list(packed)
-
-
-def prepare_weighted_train_dataset(args: argparse.Namespace, tokenizer, movie_token_id_set: set[int], logger: Logger):
-    raw_dataset = load_sft_train_dataset(args.data_dir)
+def prepare_train_dataset(args: argparse.Namespace, logger: Logger):
+    dataset = load_sft_train_dataset(args.data_dir)
     if args.max_train_examples is not None:
-        raw_dataset = raw_dataset.select(range(min(args.max_train_examples, len(raw_dataset))))
-        logger(f"Using {len(raw_dataset)} training examples because --max-train-examples is set")
-    task_weights = parse_weight_map(args.task_loss_weights)
-    logger(f"Task loss weights: {task_weights or '{}'}; default={args.default_task_loss_weight}")
-    logger(f"Movie token loss weight: {args.movie_token_loss_weight}")
+        dataset = dataset.select(range(min(args.max_train_examples, len(dataset))))
+        logger(f"Using {len(dataset)} training examples because --max-train-examples is set")
 
-    tokenized = raw_dataset.map(
-        tokenize_weighted_example,
-        fn_kwargs={
-            "tokenizer": tokenizer,
-            "movie_token_id_set": movie_token_id_set,
-            "task_weights": task_weights,
-            "default_task_weight": args.default_task_loss_weight,
-            "movie_token_loss_weight": args.movie_token_loss_weight,
-            "max_length": args.max_seq_length,
-        },
-        remove_columns=raw_dataset.column_names,
-        desc="Tokenizing weighted SFT examples",
+    dataset = dataset.map(
+        to_prompt_completion,
+        remove_columns=dataset.column_names,
+        desc="Formatting SFT prompt-completion examples",
     )
-    if args.packing:
-        tokenized = pack_weighted_records(tokenized, args.max_seq_length)
-        logger(f"Packed weighted SFT dataset into {len(tokenized)} sequences")
-    else:
-        logger(f"Prepared weighted SFT dataset with {len(tokenized)} examples")
-    return tokenized
+    logger(f"Prepared SFT prompt-completion dataset with {len(dataset)} examples")
+    return dataset
 
 
-class WeightedDataCollator:
-    def __init__(self, pad_token_id: int):
-        self.pad_token_id = pad_token_id
-
-    def __call__(self, features: list[dict]) -> dict[str, torch.Tensor]:
-        max_length = max(len(feature["input_ids"]) for feature in features)
-        batch = {"input_ids": [], "attention_mask": [], "labels": [], "loss_weights": []}
-        for feature in features:
-            length = len(feature["input_ids"])
-            pad_length = max_length - length
-            batch["input_ids"].append(feature["input_ids"] + [self.pad_token_id] * pad_length)
-            batch["attention_mask"].append(feature["attention_mask"] + [0] * pad_length)
-            batch["labels"].append(feature["labels"] + [-100] * pad_length)
-            batch["loss_weights"].append(feature["loss_weights"] + [0.0] * pad_length)
-        return {
-            "input_ids": torch.tensor(batch["input_ids"], dtype=torch.long),
-            "attention_mask": torch.tensor(batch["attention_mask"], dtype=torch.long),
-            "labels": torch.tensor(batch["labels"], dtype=torch.long),
-            "loss_weights": torch.tensor(batch["loss_weights"], dtype=torch.float32),
-        }
-
-
-class WeightedSFTTrainer(SFTTrainer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._recent_weighted_losses: list[float] = []
-        self._weighted_micro_steps = 0
-
-    def compute_loss(self, model, inputs, return_outputs: bool = False, num_items_in_batch=None):
-        labels = inputs.pop("labels")
-        loss_weights = inputs.pop("loss_weights")
-        outputs = model(**inputs)
-        logits = outputs.logits
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        shift_weights = loss_weights[..., 1:].to(dtype=shift_logits.dtype).contiguous()
-        token_loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
-            ignore_index=-100,
-            reduction="none",
-        ).view_as(shift_labels)
-        valid = shift_labels.ne(-100)
-        weights = shift_weights * valid.to(dtype=shift_weights.dtype)
-        loss = (token_loss * weights).sum() / weights.sum().clamp_min(1.0)
-        self._recent_weighted_losses.append(float(loss.detach().cpu()))
-        return (loss, outputs) if return_outputs else loss
-
-    def training_step(self, model, inputs, num_items_in_batch=None):
-        loss = super().training_step(model, inputs, num_items_in_batch)
-        self._weighted_micro_steps += 1
-        log_every_micro_steps = max(1, int(self.args.gradient_accumulation_steps) * int(self.args.logging_steps))
-        if self._weighted_micro_steps % log_every_micro_steps == 0 and self._recent_weighted_losses:
-            avg_loss = sum(self._recent_weighted_losses) / len(self._recent_weighted_losses)
-            record = {
-                "optimizer_step": self._weighted_micro_steps // max(1, int(self.args.gradient_accumulation_steps)),
-                "micro_step": self._weighted_micro_steps,
-                "weighted_loss": avg_loss,
-                "recent_micro_batches": len(self._recent_weighted_losses),
-            }
-            print(f"WEIGHTED_LOSS_LOG {json.dumps(record, ensure_ascii=False)}", flush=True)
-            self._recent_weighted_losses.clear()
-        return loss
+def sft_config_kwargs(args: argparse.Namespace) -> dict:
+    kwargs = {
+        "output_dir": str(args.output_dir),
+        "per_device_train_batch_size": args.batch_size,
+        "gradient_accumulation_steps": args.accumulation_steps,
+        "learning_rate": args.learning_rate,
+        "lr_scheduler_type": "cosine_with_min_lr",
+        "lr_scheduler_kwargs": {"min_lr": args.min_learning_rate},
+        "num_train_epochs": args.epochs,
+        "warmup_ratio": args.warmup_ratio,
+        "logging_steps": args.log_interval,
+        "save_steps": args.save_interval,
+        "save_strategy": "steps",
+        "save_total_limit": 2,
+        "bf16": args.bf16,
+        "optim": args.optim,
+        "gradient_checkpointing": args.gradient_checkpointing,
+        "packing": args.packing,
+        "max_steps": args.max_steps,
+        "report_to": "wandb" if args.use_wandb else "none",
+        "run_name": args.output_dir.name,
+    }
+    fields = set(getattr(SFTConfig, "__dataclass_fields__", {}))
+    if "max_length" in fields:
+        kwargs["max_length"] = args.max_seq_length
+    elif "max_seq_length" in fields:
+        kwargs["max_seq_length"] = args.max_seq_length
+    if "completion_only_loss" in fields:
+        kwargs["completion_only_loss"] = True
+    if "remove_unused_columns" in fields:
+        kwargs["remove_unused_columns"] = True
+    return {key: value for key, value in kwargs.items() if key in fields}
 
 
 def build_sft_config(args: argparse.Namespace) -> SFTConfig:
-    return SFTConfig(
-        output_dir=str(args.output_dir),
-        per_device_train_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.accumulation_steps,
-        learning_rate=args.learning_rate,
-        lr_scheduler_type="cosine_with_min_lr",
-        lr_scheduler_kwargs={"min_lr": args.min_learning_rate},
-        num_train_epochs=args.epochs,
-        warmup_ratio=args.warmup_ratio,
-        logging_steps=args.log_interval,
-        save_steps=args.save_interval,
-        save_strategy="steps",
-        save_total_limit=2,
-        bf16=args.bf16,
-        optim=args.optim,
-        gradient_checkpointing=args.gradient_checkpointing,
-        packing=False,
-        packing_strategy=args.packing_strategy,
-        max_length=args.max_seq_length,
-        completion_only_loss=False,
-        remove_unused_columns=False,
-        max_steps=args.max_steps,
-        report_to="wandb" if args.use_wandb else "none",
-        run_name=args.output_dir.name,
+    return SFTConfig(**sft_config_kwargs(args))
+
+
+def build_lora_config(args: argparse.Namespace, target_modules: list[str]) -> LoraConfig:
+    return LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=target_modules,
     )
-
-
-def build_lora_config(args: argparse.Namespace, target_modules: list[str], trainable_token_ids: list[int]) -> LoraConfig:
-    kwargs = {
-        "r": args.lora_r,
-        "lora_alpha": args.lora_alpha,
-        "lora_dropout": args.lora_dropout,
-        "bias": "none",
-        "task_type": "CAUSAL_LM",
-        "target_modules": target_modules,
-    }
-    if trainable_token_ids:
-        kwargs["trainable_token_indices"] = {
-            "embed_tokens": trainable_token_ids,
-            "lm_head": trainable_token_ids,
-        }
-    return LoraConfig(**kwargs)
 
 
 def main() -> None:
@@ -339,39 +157,32 @@ def main() -> None:
         os.environ.setdefault("WANDB_PROJECT", args.wandb_project)
 
     logger("2. Load tokenizer and model")
-    movie_tokens = []
-    if args.movie_tokens:
-        movie_tokens = collect_movie_tokens(args.raw_dir)
-        logger(f"Loaded {len(movie_tokens)} movie tokens")
-    tokenizer = load_tokenizer(args.model_name_or_path, movie_tokens=movie_tokens, padding_side="right")
-    trainable_movie_token_ids = movie_token_ids(tokenizer, movie_tokens)
-    if trainable_movie_token_ids:
-        logger(f"Movie-token-only tuning enabled for {len(trainable_movie_token_ids)} token ids")
+    tokenizer = load_tokenizer(args.model_name_or_path, padding_side="right")
     model = load_causal_lm(
         ModelConfig(
             args.model_name_or_path,
             load_in_4bit=args.load_in_4bit,
             attn_implementation=args.attn_implementation,
+            adapter_is_trainable=True,
         ),
         tokenizer=tokenizer,
     )
     if args.load_in_4bit:
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
 
-    logger("3. Build weighted SFT train dataset")
-    train_dataset = prepare_weighted_train_dataset(args, tokenizer, set(trainable_movie_token_ids), logger)
+    logger("3. Build SFT prompt-completion train dataset")
+    train_dataset = prepare_train_dataset(args, logger)
 
     logger("4. Build LoRA and SFT configuration")
     target_modules = split_csv(args.target_modules)
-    peft_config = build_lora_config(args, target_modules, trainable_movie_token_ids)
+    peft_config = build_lora_config(args, target_modules)
     training_args = build_sft_config(args)
 
     logger("5. Start SFT training")
-    trainer = WeightedSFTTrainer(
+    trainer = SFTTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        data_collator=WeightedDataCollator(tokenizer.pad_token_id),
         peft_config=peft_config,
         processing_class=tokenizer,
     )

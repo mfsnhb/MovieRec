@@ -10,29 +10,29 @@ from typing import Any, Callable, Iterable
 
 import pandas as pd
 
+from dataset.sft_schema import (
+    FEATURE_OUTPUT_TASKS,
+    RATING_OUTPUT_TASKS,
+    TASKS,
+    TITLE_OUTPUT_TASKS,
+    USER_PROFILE_TASKS,
+    RenderedExample,
+    build_next_movie_title_prediction,
+    build_seq_rating,
+    build_seq_title_to_feature,
+    build_single_feature_to_title,
+    build_single_title_to_feature,
+)
 from utils.data_io import (
     MovieFeatureStore,
+    clean_value,
     load_movie_feature_store,
     load_ratings,
     load_user_profiles,
-    movie_token,
     required_movie_feature_columns,
-)
-from dataset.sft_schema import (
-    ID_OUTPUT_TASKS,
-    TASKS,
-    RenderedExample,
-    build_feature_to_id,
-    build_id_to_feature,
-    build_next_movie_prediction,
-    build_seq_id_to_title,
-    build_seq_title_to_id,
-    build_single_id_to_title,
-    build_single_title_to_id,
 )
 
 SOURCE = "funrec-movielens-1m"
-USER_PROFILE_TASKS = {"NextMoviePrediction", "Seq_ID2Title", "Seq_Title2ID"}
 LEAVE_ONE_OUT_SPLITS = (
     ("train", 3),
     ("valid", 2),
@@ -53,16 +53,15 @@ class JsonlWriters:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build MovieLens Movie-ID SFT JSONL data.")
+    parser = argparse.ArgumentParser(description="Build title-based MovieLens SFT JSONL data.")
     parser.add_argument("--raw-dir", type=Path, default=Path("data/raw/funrec-movielens-1m"))
     parser.add_argument("--out-dir", type=Path, default=Path("data/processed/sft_movielens_1m"))
     parser.add_argument("--tasks", default="all")
     parser.add_argument("--min-history", type=int, default=3)
-    parser.add_argument("--max-history", type=int, default=30)
+    parser.add_argument("--max-history", type=int, default=50)
     parser.add_argument("--max-users", type=int)
     parser.add_argument("--max-examples-per-task", type=int)
     parser.add_argument("--sample-per-task", type=int, default=3)
-    parser.add_argument("--movie-token-format", choices=["angle", "plain"], default="angle")
     parser.add_argument("--prompt-template-seed", type=int, default=42)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -84,8 +83,10 @@ def record_from_rendered(
     task: str,
     split: str,
     rendered: RenderedExample,
+    movie_features: MovieFeatureStore,
     user_id: str | None = None,
     target_movie_id: str | None = None,
+    target_rating: Any | None = None,
     history: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     record = {
@@ -100,10 +101,14 @@ def record_from_rendered(
     if user_id is not None:
         record["user_id"] = user_id
     if target_movie_id is not None:
-        record["target_movie_id"] = target_movie_id
+        record["target_movie_title"] = movie_features.title(target_movie_id)
+    if target_rating is not None:
+        record["target_rating"] = clean_value(target_rating)
     if history is not None:
-        record["history_movie_ids"] = [event["movie_id"] for event in history]
-        record["history_timestamps"] = [event["timestamp"] for event in history]
+        record["history_movie_titles"] = [movie_features.title(event["movie_id"]) for event in history]
+        record["history_ratings"] = [clean_value(event["rating"]) for event in history]
+        if history and "timestamp" in history[0]:
+            record["history_timestamps"] = [clean_value(event["timestamp"]) for event in history]
     return record
 
 
@@ -129,17 +134,28 @@ def maybe_write(
     return total_written + 1
 
 
-def validate_record(record: dict[str, Any], valid_movie_tokens: set[str]) -> None:
+def validate_record(record: dict[str, Any], valid_titles: set[str]) -> None:
     if not record["instruction"] or not record["input"] or not record["output"]:
         raise ValueError(f"Empty training field in {record['id']}")
     task = record["task"]
-    if task in ID_OUTPUT_TASKS:
-        if record["output"].strip() not in valid_movie_tokens:
-            raise ValueError(f"Invalid movie ID output in {record['id']}: {record['output']}")
-    if task in {"Seq_ID2Title", "Single_ID2Title", "ID2Feature"} and "description" not in record["output"].lower():
-        raise ValueError(f"Description missing from textual output in {record['id']}")
-    if task in {"NextMoviePrediction", "Seq_ID2Title", "Seq_Title2ID"}:
-        if "stars" not in record["input"]:
+    if task in TITLE_OUTPUT_TASKS and record["output"].strip() not in valid_titles:
+        raise ValueError(f"Invalid movie title output in {record['id']}: {record['output']}")
+    if task in FEATURE_OUTPUT_TASKS:
+        output = record["output"].lower()
+        if "description" not in output or "genre" not in output:
+            raise ValueError(f"Feature output missing description or genres in {record['id']}")
+    target_title = str(record.get("target_movie_title", "")).strip()
+    if task == "Single_Feature2Title" and target_title and target_title in record["input"]:
+        raise ValueError(f"Feature-to-title input leaks target title in {record['id']}: {target_title}")
+    if task == "Single_Title2Feature" and target_title and target_title in record["output"]:
+        raise ValueError(f"Title-to-feature output repeats target title in {record['id']}: {target_title}")
+    if task in RATING_OUTPUT_TASKS:
+        try:
+            float(record["output"])
+        except ValueError as exc:
+            raise ValueError(f"Invalid rating output in {record['id']}: {record['output']}") from exc
+    if task in USER_PROFILE_TASKS:
+        if "rated" not in record["input"] or "stars" not in record["input"]:
             raise ValueError(f"Interaction rating missing from sequence input in {record['id']}")
         if "- Gender:" not in record["input"] and "User profile is unavailable." not in record["input"]:
             raise ValueError(f"User profile missing from sequence input in {record['id']}")
@@ -156,7 +172,7 @@ def load_inputs(raw_dir: Path, tasks: set[str] | None = None) -> tuple[MovieFeat
 def emit_alignment_tasks(
     tasks: set[str],
     movie_features: MovieFeatureStore,
-    valid_movie_tokens: set[str],
+    valid_titles: set[str],
     writers: JsonlWriters,
     counts: Counter,
     split_counts: Counter,
@@ -164,26 +180,25 @@ def emit_alignment_tasks(
     args: argparse.Namespace,
     total_written: int,
 ) -> int:
-    builders: dict[str, Callable[[str, MovieFeatureStore, str, random.Random | None], RenderedExample]] = {
-        "Single_ID2Title": build_single_id_to_title,
-        "Single_Title2ID": build_single_title_to_id,
-        "ID2Feature": build_id_to_feature,
-        "Feature2ID": build_feature_to_id,
+    builders: dict[str, Callable[[str, MovieFeatureStore, random.Random | None], RenderedExample]] = {
+        "Single_Title2Feature": build_single_title_to_feature,
+        "Single_Feature2Title": build_single_feature_to_title,
     }
     rng = random.Random(args.prompt_template_seed)
     for movie_id in movie_features.movie_ids:
         for task, builder in builders.items():
             if task not in tasks:
                 continue
-            rendered = builder(movie_id, movie_features, args.movie_token_format, rng)
+            rendered = builder(movie_id, movie_features, rng)
             record = record_from_rendered(
                 example_id=f"{task}:movie_{movie_id}",
                 task=task,
                 split="train",
                 rendered=rendered,
+                movie_features=movie_features,
                 target_movie_id=movie_id,
             )
-            validate_record(record, valid_movie_tokens)
+            validate_record(record, valid_titles)
             total_written = maybe_write(
                 record,
                 writers,
@@ -208,10 +223,10 @@ def loo_targets(records: list[dict[str, Any]], min_history: int, max_history: in
         yield split, target_pos, history, records[target_pos]
 
 
-def emit_sequence_tasks(
+def emit_sequence_recommendation_tasks(
     tasks: set[str],
     movie_features: MovieFeatureStore,
-    valid_movie_tokens: set[str],
+    valid_titles: set[str],
     users: dict[str, dict[str, Any]],
     ratings_df: pd.DataFrame,
     writers: JsonlWriters,
@@ -234,36 +249,30 @@ def emit_sequence_tasks(
         for split, target_pos, history, target in loo_targets(records, args.min_history, args.max_history):
             target_movie_id = target["movie_id"]
             task_renderers = []
-            if "NextMoviePrediction" in tasks:
+            if "NextMovieTitlePrediction" in tasks:
                 task_renderers.append(
                     (
-                        "NextMoviePrediction",
-                        build_next_movie_prediction(
+                        "NextMovieTitlePrediction",
+                        build_next_movie_title_prediction(users.get(user_id), history, target_movie_id, movie_features, rng),
+                    )
+                )
+            if "Seq_Title2Feature" in tasks:
+                task_renderers.append(
+                    (
+                        "Seq_Title2Feature",
+                        build_seq_title_to_feature(users.get(user_id), history, target_movie_id, movie_features, rng),
+                    )
+                )
+            if "Seq_Rating" in tasks:
+                task_renderers.append(
+                    (
+                        "Seq_Rating",
+                        build_seq_rating(
                             users.get(user_id),
                             history,
                             target_movie_id,
-                            args.movie_token_format,
-                            rng,
-                        ),
-                    )
-                )
-            if "Seq_ID2Title" in tasks:
-                task_renderers.append(
-                    (
-                        "Seq_ID2Title",
-                        build_seq_id_to_title(users.get(user_id), history, target_movie_id, movie_features, args.movie_token_format, rng),
-                    )
-                )
-            if "Seq_Title2ID" in tasks:
-                task_renderers.append(
-                    (
-                        "Seq_Title2ID",
-                        build_seq_title_to_id(
-                            users.get(user_id),
-                            history,
+                            target["rating"],
                             movie_features,
-                            target_movie_id,
-                            args.movie_token_format,
                             rng,
                         ),
                     )
@@ -274,11 +283,13 @@ def emit_sequence_tasks(
                     task=task,
                     split=split,
                     rendered=rendered,
+                    movie_features=movie_features,
                     user_id=user_id,
                     target_movie_id=target_movie_id,
+                    target_rating=target["rating"] if task == "Seq_Rating" else None,
                     history=history,
                 )
-                validate_record(record, valid_movie_tokens)
+                validate_record(record, valid_titles)
                 total_written = maybe_write(
                     record,
                     writers,
@@ -306,7 +317,7 @@ def main() -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     movie_features, users, ratings_df = load_inputs(args.raw_dir, selected_tasks)
-    valid_movie_tokens = {movie_token(movie_id, args.movie_token_format) for movie_id in movie_features.movie_ids}
+    valid_titles = {movie_features.title(movie_id) for movie_id in movie_features.movie_ids}
     user_ids = list(ratings_df["user_id"].drop_duplicates())
 
     writers = JsonlWriters(args.out_dir, ["train", "valid", "test"])
@@ -315,10 +326,10 @@ def main() -> None:
     samples: dict[str, list[dict[str, Any]]] = defaultdict(list)
     total_written = 0
     try:
-        total_written = emit_sequence_tasks(
+        total_written = emit_sequence_recommendation_tasks(
             selected_tasks,
             movie_features,
-            valid_movie_tokens,
+            valid_titles,
             users,
             ratings_df,
             writers,
@@ -329,7 +340,7 @@ def main() -> None:
             total_written,
         )
         total_written = emit_alignment_tasks(
-            selected_tasks, movie_features, valid_movie_tokens, writers, counts, split_counts, samples, args, total_written
+            selected_tasks, movie_features, valid_titles, writers, counts, split_counts, samples, args, total_written
         )
     finally:
         writers.close()
@@ -348,6 +359,7 @@ def main() -> None:
             "counts_by_split_task": split_task_counts,
             "num_users": len(user_ids),
             "num_movies": len(movie_features),
+            "num_unique_titles": len(valid_titles),
         },
     )
     write_json(
@@ -361,7 +373,6 @@ def main() -> None:
             "sequence_split_protocol": "leave_one_out",
             "leave_one_out_splits": {split: f"target is the {offset} item from the end" for split, offset in LEAVE_ONE_OUT_SPLITS},
             "max_examples_per_task": args.max_examples_per_task,
-            "movie_token_format": args.movie_token_format,
             "prompt_template_seed": args.prompt_template_seed,
             "splits": {split: sum(count for (s, _), count in split_counts.items() if s == split) for split in ["train", "valid", "test"]},
         },

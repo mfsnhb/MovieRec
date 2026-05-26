@@ -10,13 +10,15 @@ from tqdm import tqdm
 from dataset.build_sft_dataset import loo_targets
 from utils.data_io import (
     clean_value,
-    load_id_inputs,
-    movie_token,
+    load_movie_feature_store,
+    load_ratings,
+    load_user_profiles,
+    required_movie_feature_columns,
 )
 from utils.inference import (
     GenerationConfig,
     build_recommendation_prompt,
-    generate_ranked_movie_tokens_batch,
+    generate_title_recommendations_batch,
     load_inference_components,
     prediction_record,
 )
@@ -24,17 +26,17 @@ from utils.training_utils import ensure_dir, save_json, setup_seed
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Leave-one-out evaluation for MovieRec LLM recommendation.")
+    parser = argparse.ArgumentParser(description="Leave-one-out evaluation for title-based MovieRec recommendation.")
     parser.add_argument("--model-name-or-path", required=True)
     parser.add_argument("--raw-dir", type=Path, default=Path("data/raw/funrec-movielens-1m"))
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/eval/leave_one_out"))
     parser.add_argument("--max-users", type=int)
     parser.add_argument("--min-history", type=int, default=3)
-    parser.add_argument("--max-history", type=int, default=30)
+    parser.add_argument("--max-history", type=int, default=50)
     parser.add_argument("--top-k", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--max-new-tokens", type=int, default=48)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--movie-token-format", choices=["angle", "plain"], default="angle")
     parser.add_argument("--load-in-4bit", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--attn-implementation", choices=["eager", "sdpa", "flash_attention_2"])
     return parser.parse_args()
@@ -51,16 +53,17 @@ def main() -> None:
     setup_seed(args.seed)
     ensure_dir(args.output_dir)
 
-    movie_features, users, ratings_df = load_id_inputs(args.raw_dir)
+    movie_features = load_movie_feature_store(args.raw_dir, required_movie_feature_columns({"NextMovieTitlePrediction"}))
+    users = load_user_profiles(args.raw_dir)
+    ratings_df = load_ratings(args.raw_dir, movie_features)
+    valid_titles = [movie_features.title(movie_id) for movie_id in movie_features.movie_ids]
     components = load_inference_components(
         args.model_name_or_path,
-        args.raw_dir,
-        list(movie_features.movie_ids),
-        args.movie_token_format,
+        valid_titles,
         args.load_in_4bit,
         args.attn_implementation,
     )
-    generation_config = GenerationConfig(top_k=args.top_k)
+    generation_config = GenerationConfig(top_k=args.top_k, max_new_tokens=args.max_new_tokens)
 
     predictions_path = args.output_dir / "predictions.jsonl"
     metrics = {
@@ -79,17 +82,16 @@ def main() -> None:
         def flush_pending() -> None:
             if not pending:
                 return
-            predictions = generate_ranked_movie_tokens_batch(
+            predictions = generate_title_recommendations_batch(
                 components,
                 [str(item["prompt"]) for item in pending],
                 generation_config,
-                [item["history_tokens"] for item in pending],  # type: ignore[list-item]
-                token_format=args.movie_token_format,
+                [item["history_titles"] for item in pending],  # type: ignore[list-item]
             )
             for item, prediction in zip(pending, predictions, strict=True):
-                target_token = str(item["target_token"])
-                ranked = prediction["predicted_movie_ids"]
-                rank = ranked.index(target_token) + 1 if target_token in ranked else None
+                target_title = str(item["target_movie_title"])
+                ranked = prediction["predicted_movie_titles"]
+                rank = ranked.index(target_title) + 1 if target_title in ranked else None
 
                 metrics["total"] += 1
                 metrics["hr@1"] += int(rank == 1)
@@ -104,7 +106,7 @@ def main() -> None:
                             str(item["user_id"]),
                             str(item["split"]),
                             int(item["target_pos"]),
-                            target_token,
+                            target_title,
                             prediction,
                             rank,
                         ),
@@ -115,7 +117,7 @@ def main() -> None:
             pending.clear()
 
         processed_users = 0
-        for user_id, user_ratings in tqdm(grouped, desc="leave-one-out eval"):
+        for user_id, user_ratings in tqdm(grouped, desc="leave-one-out title eval"):
             if args.max_users is not None and processed_users >= args.max_users:
                 break
             records = user_ratings.to_dict("records")
@@ -125,17 +127,18 @@ def main() -> None:
             for split, target_pos, history, target in loo_targets(records, args.min_history, args.max_history):
                 if split != "test":
                     continue
-                target_token = movie_token(clean_value(target["movie_id"]), args.movie_token_format)
-                prompt = build_recommendation_prompt(users.get(user_id), history, args.movie_token_format)
-                history_tokens = {movie_token(clean_value(event["movie_id"]), args.movie_token_format) for event in history}
+                target_movie_id = clean_value(target["movie_id"])
+                target_title = movie_features.title(target_movie_id)
+                prompt = build_recommendation_prompt(users.get(user_id), history, movie_features)
+                history_titles = {movie_features.title(event["movie_id"]) for event in history}
                 pending.append(
                     {
                         "user_id": user_id,
                         "split": split,
                         "target_pos": target_pos,
-                        "target_token": target_token,
+                        "target_movie_title": target_title,
                         "prompt": prompt,
-                        "history_tokens": history_tokens,
+                        "history_titles": history_titles,
                     }
                 )
                 if len(pending) >= args.batch_size:
@@ -150,6 +153,9 @@ def main() -> None:
         "HR@10": metrics["hr@10"] / total,
         "NDCG@5": metrics["ndcg@5"] / total,
         "NDCG@10": metrics["ndcg@10"] / total,
+        "top_k": args.top_k,
+        "max_history": args.max_history,
+        "prediction_unit": "movie_title",
     }
     save_json(args.output_dir / "leave_one_out_metrics.json", normalized)
     print(json.dumps(normalized, indent=2, ensure_ascii=False))

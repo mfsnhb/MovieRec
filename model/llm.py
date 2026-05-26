@@ -3,14 +3,11 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Literal
 
-import pandas as pd
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import PeftModel
-
-from utils.data_io import clean_value, movie_id_sort_key, movie_token
 
 
 @dataclass(frozen=True)
@@ -21,6 +18,7 @@ class ModelConfig:
     bnb_4bit_compute_dtype: str = "bfloat16"
     trust_remote_code: bool = True
     attn_implementation: str | None = None
+    adapter_is_trainable: bool = False
 
 
 def torch_dtype(dtype: str) -> torch.dtype:
@@ -48,21 +46,8 @@ def build_quantization_config(config: ModelConfig) -> BitsAndBytesConfig | None:
     )
 
 
-def collect_movie_tokens(
-    raw_dir: Path | str,
-    token_format: Literal["angle", "plain"] = "angle",
-) -> list[str]:
-    movies_path = Path(raw_dir) / "movies.pkl"
-    if not movies_path.exists():
-        raise FileNotFoundError(f"Movie metadata not found: {movies_path}")
-    movies_df = pd.read_pickle(movies_path)
-    movie_ids = {clean_value(movie_id) for movie_id in movies_df["movie_id"].tolist()}
-    return [movie_token(movie_id, token_format) for movie_id in sorted(movie_ids, key=movie_id_sort_key)]
-
-
 def load_tokenizer(
     model_name_or_path: str,
-    movie_tokens: Iterable[str] = (),
     trust_remote_code: bool = True,
     padding_side: Literal["left", "right"] = "right",
 ):
@@ -70,9 +55,6 @@ def load_tokenizer(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = padding_side
-    tokens = list(movie_tokens)
-    if tokens:
-        tokenizer.add_tokens(tokens)
     return tokenizer
 
 
@@ -104,9 +86,7 @@ def load_causal_lm(config: ModelConfig, tokenizer=None):
     if config.attn_implementation:
         kwargs["attn_implementation"] = config.attn_implementation
     model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
-    if tokenizer is not None and len(tokenizer) != model.get_input_embeddings().weight.shape[0]:
-        model.resize_token_embeddings(len(tokenizer))
     if base_model_path is not None:
-        model = PeftModel.from_pretrained(model, str(adapter_path))
+        model = PeftModel.from_pretrained(model, str(adapter_path), is_trainable=config.adapter_is_trainable)
     model.config.use_cache = False
     return model
