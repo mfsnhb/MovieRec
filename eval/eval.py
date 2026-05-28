@@ -13,20 +13,19 @@ from utils.data_io import (
     load_movie_feature_store,
     load_ratings,
     load_user_profiles,
-    required_movie_feature_columns,
 )
 from utils.inference import (
-    GenerationConfig,
+    RankingConfig,
     build_recommendation_prompt,
-    generate_title_recommendations_batch,
     load_inference_components,
     prediction_record,
+    rank_movie_recommendations_batch,
 )
 from utils.training_utils import ensure_dir, save_json, setup_seed
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Leave-one-out evaluation for title-based MovieRec recommendation.")
+    parser = argparse.ArgumentParser(description="Leave-one-out evaluation for MovieRec movie ID token recommendation.")
     parser.add_argument("--model-name-or-path", required=True)
     parser.add_argument("--raw-dir", type=Path, default=Path("data/raw/funrec-movielens-1m"))
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/eval/leave_one_out"))
@@ -34,7 +33,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-history", type=int, default=3)
     parser.add_argument("--max-history", type=int, default=50)
     parser.add_argument("--top-k", type=int, default=10)
-    parser.add_argument("--max-new-tokens", type=int, default=48)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--load-in-4bit", action=argparse.BooleanOptionalAction, default=True)
@@ -53,17 +51,16 @@ def main() -> None:
     setup_seed(args.seed)
     ensure_dir(args.output_dir)
 
-    movie_features = load_movie_feature_store(args.raw_dir, required_movie_feature_columns({"NextMovieTitlePrediction"}))
+    movie_features = load_movie_feature_store(args.raw_dir, {"movie_id", "title"})
     users = load_user_profiles(args.raw_dir)
     ratings_df = load_ratings(args.raw_dir, movie_features)
-    valid_titles = [movie_features.title(movie_id) for movie_id in movie_features.movie_ids]
     components = load_inference_components(
         args.model_name_or_path,
-        valid_titles,
+        movie_features,
         args.load_in_4bit,
         args.attn_implementation,
     )
-    generation_config = GenerationConfig(top_k=args.top_k, max_new_tokens=args.max_new_tokens)
+    ranking_config = RankingConfig(top_k=args.top_k)
 
     predictions_path = args.output_dir / "predictions.jsonl"
     metrics = {
@@ -82,16 +79,16 @@ def main() -> None:
         def flush_pending() -> None:
             if not pending:
                 return
-            predictions = generate_title_recommendations_batch(
+            predictions = rank_movie_recommendations_batch(
                 components,
                 [str(item["prompt"]) for item in pending],
-                generation_config,
-                [item["history_titles"] for item in pending],  # type: ignore[list-item]
+                ranking_config,
+                [item["history_movie_ids"] for item in pending],  # type: ignore[list-item]
             )
             for item, prediction in zip(pending, predictions, strict=True):
-                target_title = str(item["target_movie_title"])
-                ranked = prediction["predicted_movie_titles"]
-                rank = ranked.index(target_title) + 1 if target_title in ranked else None
+                target_movie_id = str(item["target_movie_id"])
+                ranked = prediction["predicted_movie_ids"]
+                rank = ranked.index(target_movie_id) + 1 if target_movie_id in ranked else None
 
                 metrics["total"] += 1
                 metrics["hr@1"] += int(rank == 1)
@@ -106,7 +103,9 @@ def main() -> None:
                             str(item["user_id"]),
                             str(item["split"]),
                             int(item["target_pos"]),
-                            target_title,
+                            target_movie_id,
+                            str(item["target_movie_token"]),
+                            str(item["target_movie_title"]),
                             prediction,
                             rank,
                         ),
@@ -117,7 +116,7 @@ def main() -> None:
             pending.clear()
 
         processed_users = 0
-        for user_id, user_ratings in tqdm(grouped, desc="leave-one-out title eval"):
+        for user_id, user_ratings in tqdm(grouped, desc="leave-one-out movie token eval"):
             if args.max_users is not None and processed_users >= args.max_users:
                 break
             records = user_ratings.to_dict("records")
@@ -128,17 +127,17 @@ def main() -> None:
                 if split != "test":
                     continue
                 target_movie_id = clean_value(target["movie_id"])
-                target_title = movie_features.title(target_movie_id)
                 prompt = build_recommendation_prompt(users.get(user_id), history, movie_features)
-                history_titles = {movie_features.title(event["movie_id"]) for event in history}
                 pending.append(
                     {
                         "user_id": user_id,
                         "split": split,
                         "target_pos": target_pos,
-                        "target_movie_title": target_title,
+                        "target_movie_id": target_movie_id,
+                        "target_movie_token": movie_features.token(target_movie_id),
+                        "target_movie_title": movie_features.title(target_movie_id),
                         "prompt": prompt,
-                        "history_titles": history_titles,
+                        "history_movie_ids": {clean_value(event["movie_id"]) for event in history},
                     }
                 )
                 if len(pending) >= args.batch_size:
@@ -155,7 +154,7 @@ def main() -> None:
         "NDCG@10": metrics["ndcg@10"] / total,
         "top_k": args.top_k,
         "max_history": args.max_history,
-        "prediction_unit": "movie_title",
+        "prediction_unit": "movie_id_token",
     }
     save_json(args.output_dir / "leave_one_out_metrics.json", normalized)
     print(json.dumps(normalized, indent=2, ensure_ascii=False))

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -13,17 +14,19 @@ from transformers import TrainerCallback
 
 from model.llm import ModelConfig, load_causal_lm, load_tokenizer
 from utils.data_io import load_movie_feature_store, required_movie_feature_columns
-from utils.inference import build_title_lookup, extract_valid_titles, normalize_title_text
-from utils.training_utils import Logger, ensure_dir, print_trainable_parameters, save_json, setup_seed
+from utils.training_utils import Logger, ensure_dir, print_trainable_parameters, save_json, save_last_checkpoint_as_final, setup_seed
+
+
+MOVIE_TOKEN_RE = re.compile(r"\bmovie_\d+\b")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="QLoRA GRPO for title-based MovieRec recommendation.")
-    parser.add_argument("--model-name-or-path", type=str, default="models/SFT/qwen3_4b_QLoRA/final")
+    parser = argparse.ArgumentParser(description="QLoRA GRPO for MovieRec movie ID token recommendation.")
+    parser.add_argument("--model-name-or-path", type=str, default="models/sft/qwen3_4b_QLoRA/final")
     parser.add_argument("--data-dir", type=Path, default=Path("data/processed/grpo_movielens_1m"))
     parser.add_argument("--output-dir", type=Path, default=Path("models/grpo/qwen3_4b_QLoRA"))
     parser.add_argument("--logging-dir", type=Path, default=Path("outputs/grpo/qwen3_4b_QLoRA"))
-    parser.add_argument("--max-completion-length", type=int, default=16)
+    parser.add_argument("--max-completion-length", type=int, default=4)
     parser.add_argument("--num-generations", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--accumulation-steps", type=int, default=8)
@@ -50,10 +53,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--raw-dir", type=Path, default=Path("data/raw/funrec-movielens-1m"))
     parser.add_argument("--reranker-score-path", type=Path)
     parser.add_argument("--reranker-reward-weight", type=float, default=0.1)
-    parser.add_argument("--valid-title-reward", type=float, default=0.1)
-    parser.add_argument("--invalid-title-penalty", type=float, default=-0.5)
-    parser.add_argument("--history-title-penalty", type=float, default=-0.3)
-    parser.add_argument("--duplicate-title-penalty", type=float, default=-0.1)
+    parser.add_argument("--valid-token-reward", type=float, default=0.1)
+    parser.add_argument("--invalid-token-penalty", type=float, default=-0.5)
+    parser.add_argument("--history-token-penalty", type=float, default=-0.3)
+    parser.add_argument("--duplicate-token-penalty", type=float, default=-0.1)
     parser.add_argument("--resume-from-checkpoint", type=str)
     parser.add_argument("--use-wandb", action="store_true")
     parser.add_argument("--wandb-project", default="MovieRec")
@@ -97,6 +100,32 @@ def build_grpo_config(args: argparse.Namespace) -> GRPOConfig:
     )
 
 
+def split_csv(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [name.strip() for name in value.split(",") if name.strip()]
+
+
+def build_lora_config(args: argparse.Namespace, movie_token_ids: list[int]) -> LoraConfig:
+    kwargs = {
+        "r": args.lora_r,
+        "lora_alpha": args.lora_alpha,
+        "lora_dropout": args.lora_dropout,
+        "bias": "none",
+        "task_type": "CAUSAL_LM",
+        "target_modules": split_csv(args.target_modules),
+    }
+    fields = set(getattr(LoraConfig, "__dataclass_fields__", {}))
+    if movie_token_ids:
+        if "trainable_token_indices" not in fields:
+            raise RuntimeError(
+                "The installed PEFT version does not support trainable_token_indices. "
+                "Use the remote PEFT version used for the experiments, or upgrade PEFT."
+            )
+        kwargs["trainable_token_indices"] = movie_token_ids
+    return LoraConfig(**kwargs)
+
+
 def extract_completion_text(completion: Any) -> str:
     if isinstance(completion, str):
         return completion
@@ -105,20 +134,20 @@ def extract_completion_text(completion: Any) -> str:
     return str(completion)
 
 
-def first_valid_title(completion: Any, valid_title_by_normalized: dict[str, str]) -> str | None:
-    titles = extract_valid_titles(extract_completion_text(completion), valid_title_by_normalized)
-    return titles[0] if titles else None
+def extract_valid_movie_tokens(completion: Any, valid_movie_tokens: set[str]) -> list[str]:
+    seen: set[str] = set()
+    tokens: list[str] = []
+    for match in MOVIE_TOKEN_RE.finditer(extract_completion_text(completion)):
+        token = match.group(0)
+        if token in valid_movie_tokens and token not in seen:
+            seen.add(token)
+            tokens.append(token)
+    return tokens
 
 
-def title_lookup(
-    completion: Any,
-    valid_title_by_normalized: dict[str, str],
-    title_to_movie_id: dict[str, str],
-) -> tuple[str | None, str | None]:
-    title = first_valid_title(completion, valid_title_by_normalized)
-    if title is None:
-        return None, None
-    return title, title_to_movie_id.get(normalize_title_text(title))
+def first_valid_movie_token(completion: Any, valid_movie_tokens: set[str]) -> str | None:
+    tokens = extract_valid_movie_tokens(completion, valid_movie_tokens)
+    return tokens[0] if tokens else None
 
 
 class RewardStats:
@@ -155,20 +184,19 @@ class RerankerScores:
         return float(self.percentiles[row, col])
 
 
-def build_title_maps(raw_dir: Path) -> tuple[dict[str, str], dict[str, str]]:
-    movie_features = load_movie_feature_store(raw_dir, required_movie_feature_columns({"NextMovieTitlePrediction"}))
-    valid_titles = [movie_features.title(movie_id) for movie_id in movie_features.movie_ids]
-    valid_title_by_normalized = build_title_lookup(valid_titles)
-    title_to_movie_id = {normalize_title_text(movie_features.title(movie_id)): movie_id for movie_id in movie_features.movie_ids}
-    return title_to_movie_id, valid_title_by_normalized
+def build_movie_token_maps(raw_dir: Path) -> tuple[dict[str, str], set[str], list[str]]:
+    movie_features = load_movie_feature_store(raw_dir, required_movie_feature_columns({"NextMoviePrediction"}))
+    token_to_movie_id = movie_features.movie_token_to_id
+    movie_tokens = list(movie_features.movie_tokens)
+    return token_to_movie_id, set(movie_tokens), movie_tokens
 
 
-def build_exact_match_reward(valid_title_by_normalized: dict[str, str]):
-    def exact_match_reward(completions: list[Any], target_movie_title: list[str], **_: Any) -> list[float]:
+def build_exact_match_reward(valid_movie_tokens: set[str]):
+    def exact_match_reward(completions: list[Any], target_movie_token: list[str], **_: Any) -> list[float]:
         rewards = []
-        for completion, target in zip(completions, target_movie_title):
-            title = first_valid_title(completion, valid_title_by_normalized)
-            rewards.append(1.0 if title is not None and normalize_title_text(title) == normalize_title_text(target) else 0.0)
+        for completion, target in zip(completions, target_movie_token):
+            token = first_valid_movie_token(completion, valid_movie_tokens)
+            rewards.append(1.0 if token == target else 0.0)
         return rewards
 
     return exact_match_reward
@@ -176,26 +204,24 @@ def build_exact_match_reward(valid_title_by_normalized: dict[str, str]):
 
 def build_validity_reward(
     args: argparse.Namespace,
-    title_to_movie_id: dict[str, str],
-    valid_title_by_normalized: dict[str, str],
+    valid_movie_tokens: set[str],
     stats: RewardStats,
 ):
-    def validity_reward(completions: list[Any], history_movie_titles: list[list[str]], **_: Any) -> list[float]:
+    def validity_reward(completions: list[Any], history_movie_tokens: list[list[str]], **_: Any) -> list[float]:
         rewards = []
         valid_count = 0
         history_count = 0
-        for completion, history_titles in zip(completions, history_movie_titles):
-            title, movie_id = title_lookup(completion, valid_title_by_normalized, title_to_movie_id)
-            if movie_id is None:
-                rewards.append(args.invalid_title_penalty)
+        for completion, history_tokens in zip(completions, history_movie_tokens):
+            token = first_valid_movie_token(completion, valid_movie_tokens)
+            if token is None:
+                rewards.append(args.invalid_token_penalty)
                 continue
             valid_count += 1
-            history = {normalize_title_text(title) for title in history_titles}
-            if normalize_title_text(title) in history:
+            if token in set(history_tokens):
                 history_count += 1
-                rewards.append(args.history_title_penalty)
+                rewards.append(args.history_token_penalty)
             else:
-                rewards.append(args.valid_title_reward)
+                rewards.append(args.valid_token_reward)
         total = max(1, len(completions))
         stats.add(valid_rate=valid_count / total, history_rate=history_count / total, validity_reward_mean=float(np.mean(rewards)) if rewards else 0.0)
         return rewards
@@ -203,38 +229,37 @@ def build_validity_reward(
     return validity_reward
 
 
-def build_duplicate_title_reward(
+def build_duplicate_token_reward(
     args: argparse.Namespace,
-    valid_title_by_normalized: dict[str, str],
+    valid_movie_tokens: set[str],
     stats: RewardStats,
 ):
-    def duplicate_title_reward(completions: list[Any], prompt: list[Any] | None = None, **_: Any) -> list[float]:
+    def duplicate_token_reward(completions: list[Any], prompt: list[Any] | None = None, **_: Any) -> list[float]:
         if prompt is None:
             return [0.0] * len(completions)
         rewards = [0.0] * len(completions)
         duplicate_count = 0
-        group_titles: dict[Any, set[str]] = {}
+        group_tokens: dict[Any, set[str]] = {}
         for index, (completion, prompt_text) in enumerate(zip(completions, prompt)):
-            title = first_valid_title(completion, valid_title_by_normalized)
-            if title is None:
+            token = first_valid_movie_token(completion, valid_movie_tokens)
+            if token is None:
                 continue
-            normalized = normalize_title_text(title)
-            seen = group_titles.setdefault(prompt_text, set())
-            if normalized in seen:
-                rewards[index] = args.duplicate_title_penalty
+            seen = group_tokens.setdefault(prompt_text, set())
+            if token in seen:
+                rewards[index] = args.duplicate_token_penalty
                 duplicate_count += 1
             else:
-                seen.add(normalized)
-        stats.add(duplicate_rate=duplicate_count / max(1, len(completions)), duplicate_title_reward_mean=float(np.mean(rewards)) if rewards else 0.0)
+                seen.add(token)
+        stats.add(duplicate_rate=duplicate_count / max(1, len(completions)), duplicate_token_reward_mean=float(np.mean(rewards)) if rewards else 0.0)
         return rewards
 
-    return duplicate_title_reward
+    return duplicate_token_reward
 
 
 def build_reranker_reward(
     args: argparse.Namespace,
-    title_to_movie_id: dict[str, str],
-    valid_title_by_normalized: dict[str, str],
+    token_to_movie_id: dict[str, str],
+    valid_movie_tokens: set[str],
     stats: RewardStats,
 ):
     reranker = RerankerScores(args.reranker_score_path) if args.reranker_score_path is not None and args.reranker_reward_weight != 0.0 else None
@@ -245,7 +270,8 @@ def build_reranker_reward(
         rewards = []
         matched = 0
         for completion, uid in zip(completions, user_id):
-            _, movie_id = title_lookup(completion, valid_title_by_normalized, title_to_movie_id)
+            token = first_valid_movie_token(completion, valid_movie_tokens)
+            movie_id = token_to_movie_id.get(token) if token is not None else None
             if movie_id is None:
                 rewards.append(0.0)
                 continue
@@ -259,15 +285,15 @@ def build_reranker_reward(
 
 def build_reward_funcs(
     args: argparse.Namespace,
-    title_to_movie_id: dict[str, str],
-    valid_title_by_normalized: dict[str, str],
+    token_to_movie_id: dict[str, str],
+    valid_movie_tokens: set[str],
 ) -> list:
     stats = RewardStats(args.reward_log_interval)
     return [
-        build_exact_match_reward(valid_title_by_normalized),
-        build_validity_reward(args, title_to_movie_id, valid_title_by_normalized, stats),
-        build_duplicate_title_reward(args, valid_title_by_normalized, stats),
-        build_reranker_reward(args, title_to_movie_id, valid_title_by_normalized, stats),
+        build_exact_match_reward(valid_movie_tokens),
+        build_validity_reward(args, valid_movie_tokens, stats),
+        build_duplicate_token_reward(args, valid_movie_tokens, stats),
+        build_reranker_reward(args, token_to_movie_id, valid_movie_tokens, stats),
     ]
 
 
@@ -291,38 +317,31 @@ def main() -> None:
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
     os.environ.setdefault("HF_LOGGING_VERBOSITY", "info")
 
-    logger("2. Load GRPO train.jsonl")
+    logger("2. Load GRPO train.jsonl and movie token catalog")
     train_dataset = load_grpo_train_dataset(args.data_dir)
-    title_to_movie_id, valid_title_by_normalized = build_title_maps(args.raw_dir)
+    token_to_movie_id, valid_movie_tokens, movie_tokens = build_movie_token_maps(args.raw_dir)
     if args.reranker_score_path is not None and "user_id" not in train_dataset.column_names:
         raise ValueError("GRPO data must be rebuilt with user_id to use SASRec reranker rewards.")
 
     logger("3. Load tokenizer and SFT policy model")
     tokenizer = load_tokenizer(args.model_name_or_path, padding_side="left")
+    tokenizer.add_tokens(movie_tokens, special_tokens=False)
+    movie_token_ids = [int(token_id) for token_id in tokenizer.convert_tokens_to_ids(movie_tokens)]
     model = load_causal_lm(
         ModelConfig(
             args.model_name_or_path,
-            load_in_4bit=False,
+            load_in_4bit=args.load_in_4bit,
             attn_implementation=args.attn_implementation,
-            adapter_is_trainable=False,
+            adapter_is_trainable=True,
         ),
         tokenizer=tokenizer,
     )
-    if isinstance(model, PeftModel):
-        model = model.merge_and_unload()
-    logger("4. Build GRPO LoRA and training configuration")
-    peft_config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=[name.strip() for name in args.target_modules.split(",") if name.strip()],
-    )
-    if args.load_in_4bit:
+    is_peft_model = isinstance(model, PeftModel)
+    if args.load_in_4bit and not is_peft_model:
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
-    print_trainable_parameters(model, logger)
 
+    logger("4. Build GRPO LoRA and training configuration")
+    peft_config = None if is_peft_model else build_lora_config(args, movie_token_ids)
     training_args = build_grpo_config(args)
 
     logger("5. Start GRPO training")
@@ -330,20 +349,20 @@ def main() -> None:
 
     trainer = GRPOTrainer(
         model=model,
-        reward_funcs=build_reward_funcs(args, title_to_movie_id, valid_title_by_normalized),
+        reward_funcs=build_reward_funcs(args, token_to_movie_id, valid_movie_tokens),
         args=training_args,
         train_dataset=train_dataset,
         processing_class=tokenizer,
         peft_config=peft_config,
     )
     trainer.add_callback(FlushLogCallback())
+    print_trainable_parameters(trainer.model, logger)
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
 
-    logger("6. Save final GRPO adapter and tokenizer")
-    final_dir = ensure_dir(args.output_dir / "final")
-    trainer.save_model(str(final_dir))
-    tokenizer.save_pretrained(str(final_dir))
-    logger(f"Saved final GRPO checkpoint to {final_dir}")
+    logger("6. Save final GRPO adapter and tokenizer once")
+    final_dir = save_last_checkpoint_as_final(trainer, tokenizer, args.output_dir, logger)
+    save_json(final_dir / "movie_tokens.json", [{"movie_token": token, "movie_id": token_to_movie_id[token]} for token in movie_tokens])
+    logger(f"Final GRPO model is available at {final_dir}")
 
 
 if __name__ == "__main__":

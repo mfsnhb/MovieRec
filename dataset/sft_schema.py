@@ -7,168 +7,131 @@ from typing import Any, Iterable
 from utils.data_io import MovieFeatureStore, clean_value
 
 TASKS = (
-    "NextMovieTitlePrediction",
-    "Seq_Title2Feature",
-    "Seq_Rating",
-    "Single_Title2Feature",
-    "Single_Feature2Title",
+    "NextMoviePrediction",
+    "Seq_ID2Feature",
+    "Seq_Feature2ID",
+    "ID2Feature",
+    "Feature2ID",
 )
-TITLE_OUTPUT_TASKS = {
-    "NextMovieTitlePrediction",
-    "Single_Feature2Title",
+ALIGNMENT_TASKS = (
+    "ID2Feature",
+    "Feature2ID",
+)
+RECOMMENDATION_TASKS = (
+    "NextMoviePrediction",
+    "Seq_ID2Feature",
+    "Seq_Feature2ID",
+)
+ID_OUTPUT_TASKS = {
+    "NextMoviePrediction",
+    "Seq_Feature2ID",
+    "Feature2ID",
 }
-FEATURE_OUTPUT_TASKS = {
-    "Seq_Title2Feature",
-    "Single_Title2Feature",
-}
-RATING_OUTPUT_TASKS = {
-    "Seq_Rating",
-}
-USER_PROFILE_TASKS = {
-    "NextMovieTitlePrediction",
-    "Seq_Title2Feature",
-    "Seq_Rating",
-}
+FEATURE_OUTPUT_TASKS = {"Seq_ID2Feature", "ID2Feature"}
+USER_PROFILE_TASKS = {"NextMoviePrediction", "Seq_ID2Feature", "Seq_Feature2ID"}
 
 INSTRUCTION = (
-    "You are a helpful movie recommendation assistant. Use the user's viewing history "
-    "and movie information to make clear, concise recommendations."
+    "You are a helpful movie recommendation assistant. Use the user's profile, "
+    "MovieLens movie ID tokens, ratings, and movie information to make clear predictions."
 )
-TITLE_ONLY_SUFFIX = "Answer with exactly one movie title from MovieLens, including the year in parentheses, and no other words."
-RATING_ONLY_SUFFIX = "Answer with exactly one rating number on the same scale as the user's ratings, and no other words."
+MOVIE_TOKEN_ONLY_SUFFIX = "Answer with exactly one MovieLens movie ID token, such as movie_1, and no other words."
 
 PROMPT_TEMPLATES = {
-    "NextMovieTitlePrediction": [
+    "NextMoviePrediction": [
         """User profile:
 {user_profile}
 
-Here is the user's movie-watching history. Each line gives the movie title and the rating the user gave it:
+Here is the user's recent MovieLens trail. Each line names a movie by its catalog token and shows how the user rated it:
 {history}
 
-Based on this profile and rating history, recommend the movie the user is most likely to watch next. {title_only_suffix}""",
+Use the profile and the pattern in these ratings to choose the movie this user is most likely to watch next. {movie_token_only_suffix}""",
         """The user can be described as follows:
 {user_profile}
 
-The user's interactions are listed below as movie titles with the ratings they gave:
+Below is the user's viewing sequence in watch order. Each movie is represented by its MovieLens ID token, followed by the user's rating:
 {history}
 
-Use this profile and sequence to predict the next movie title. {title_only_suffix}""",
+Infer the next movie that best fits this user's taste. {movie_token_only_suffix}""",
         """Profile:
 {user_profile}
 
-The following records summarize the user's rated movies:
+The user's past ratings form this movie trail:
 {history}
 
-What movie title should come next for this user? {title_only_suffix}""",
+Based on the profile and this trail, choose the next MovieLens movie token for the user. {movie_token_only_suffix}""",
         """Consider this user's profile:
 {user_profile}
 
-Their movie sequence is below. Each line says which title the user rated and how many stars they gave it:
+Their recent ratings are shown below. The token identifies the movie, and the stars show the user's preference:
 {history}
 
-Please infer the next likely MovieLens title from the profile and ratings. {title_only_suffix}""",
+Recommend the next movie that matches this user's observed preferences. {movie_token_only_suffix}""",
     ],
-    "Seq_Title2Feature": [
+    "Seq_ID2Feature": [
         """User profile:
 {user_profile}
 
-The user has this MovieLens interaction history, represented by movie titles and ratings:
+Recent movies this user watched, in order, with ratings:
 {history}
 
-Describe the kind of movie this user is likely to watch next. Include the title, genres, and description naturally in your answer.""",
+Based on this user's taste, describe the next movie they would probably like. Include the movie title, genres, and a brief story summary.""",
         """The user can be described as follows:
 {user_profile}
 
-Here is the user's sequence of rated movie titles:
+Their recent viewing history is:
 {history}
 
-Write a natural description of the next movie, including its title, genres, and description.""",
-        """Profile:
-{user_profile}
-
-The user's MovieLens title history is shown below:
-{history}
-
-What movie does this profile and sequence of ratings point to next? Answer in prose and include the title, genres, and description.""",
-        """A user with this profile:
-{user_profile}
-
-has the following ordered list of movie titles and ratings:
-{history}
-
-Summarize the likely next movie in natural language, making sure the title, genres, and description are present.""",
+Write a short catalog-style description of the movie that should come next for this user, including title, genres, and plot.""",
     ],
-    "Seq_Rating": [
+    "Seq_Feature2ID": [
         """User profile:
 {user_profile}
 
-The following training interactions summarize this user's known movie ratings:
+Recent movies this user watched, in order, with ratings:
 {history}
 
-Candidate movie:
-{candidate_title}
+The next movie is described as:
+{movie_feature}
 
-Predict the rating this user would give the candidate movie. {rating_only_suffix}""",
+Return the MovieLens ID token for this next movie. {movie_token_only_suffix}""",
         """The user can be described as follows:
 {user_profile}
 
-Known training-set ratings:
+Their recent viewing history is:
 {history}
 
-Given candidate title: {candidate_title}
+Here is the catalog profile of the next movie:
+{movie_feature}
 
-What rating would this user give this movie? {rating_only_suffix}""",
-        """Profile:
-{user_profile}
-
-Training history, as movie titles with user ratings:
-{history}
-
-Now estimate the user's rating for {candidate_title}. {rating_only_suffix}""",
-        """Use the user's profile and all available training-set ratings to estimate a rating.
-
-Profile:
-{user_profile}
-
-Training ratings:
-{history}
-
-Movie to rate: {candidate_title}
-
-Return the rating. {rating_only_suffix}""",
+Which MovieLens ID token matches this movie? {movie_token_only_suffix}""",
     ],
-    "Single_Title2Feature": [
-        """The movie title is {movie_title}.
+    "ID2Feature": [
+        """The MovieLens movie ID token is {movie_token}.
 
-Describe this movie in natural language using its genres and description. Do not repeat the title.""",
-        """Please explain the movie {movie_title}. Include its genres and description in a natural sentence, without restating the title.""",
-        """What kind of movie is {movie_title}? Describe it with genres and description, but do not copy the title into the answer.""",
-        """Turn the movie title {movie_title} into concise natural-language movie features with genres and description. Do not repeat the title.""",
+Write a short, natural MovieLens catalog note for this token. Mention the movie name, genres, and story.""",
+        """For {movie_token}, write the kind of movie profile a recommender could use. Keep it to the title, genres, and plot summary.""",
+        """Turn {movie_token} into a natural description of the movie: what it is called, what kind of movie it is, and what it is about.""",
+        """Write a concise movie profile for {movie_token}, using only the movie name, genres, and story summary.""",
     ],
-    "Single_Feature2Title": [
-        """Here is a natural-language description of a movie:
-{movie_text}
+    "Feature2ID": [
+        """Read this MovieLens catalog note:
+{movie_feature}
 
-Which MovieLens title does this description refer to? {title_only_suffix}""",
-        """Identify the MovieLens title from this description:
-{movie_text}
+Which MovieLens movie ID token refers to this movie? {movie_token_only_suffix}""",
+        """Given this natural movie profile:
+{movie_feature}
 
-{title_only_suffix}""",
-        """A movie is described below:
-{movie_text}
+Identify the matching MovieLens movie ID token. {movie_token_only_suffix}""",
+        """This catalog description belongs to one MovieLens movie:
+{movie_feature}
 
-Return the matching MovieLens title. {title_only_suffix}""",
-        """Match this movie description to its MovieLens title:
-{movie_text}
+Return the MovieLens ID token for that movie. {movie_token_only_suffix}""",
+        """Match the following movie profile to its MovieLens ID token:
+{movie_feature}
 
-{title_only_suffix}""",
+{movie_token_only_suffix}""",
     ],
 }
-
-
-def render_prompt_template(task: str, rng: random.Random | None = None, **kwargs: Any) -> str:
-    sampler = rng if rng is not None else random
-    return sampler.choice(PROMPT_TEMPLATES[task]).format(**kwargs)
 
 
 @dataclass(frozen=True)
@@ -176,6 +139,11 @@ class RenderedExample:
     instruction: str
     input: str
     output: str
+
+
+def render_prompt_template(task: str, rng: random.Random | None = None, **kwargs: Any) -> str:
+    sampler = rng if rng is not None else random
+    return sampler.choice(PROMPT_TEMPLATES[task]).format(**kwargs)
 
 
 def format_user_profile(user: dict[str, Any] | None) -> str:
@@ -190,25 +158,20 @@ def format_user_profile(user: dict[str, Any] | None) -> str:
     )
 
 
-def format_title_interaction_history(history: Iterable[dict[str, Any]], movie_features: MovieFeatureStore) -> str:
+def format_id_interaction_history(history: Iterable[dict[str, Any]], movie_features: MovieFeatureStore) -> str:
     lines = []
     for event in history:
         movie_id = clean_value(event.get("movie_id"))
-        title = movie_features.title(movie_id)
         rating = clean_value(event.get("rating"))
-        lines.append(f"- {title} | rating: {rating}")
+        lines.append(f"- {movie_features.token(movie_id)} | rating: {rating}")
     return "\n".join(lines)
 
 
-def movie_title_answer(movie_id: Any, movie_features: MovieFeatureStore) -> str:
-    return movie_features.title(movie_id)
+def movie_token_answer(movie_id: Any, movie_features: MovieFeatureStore) -> str:
+    return movie_features.token(movie_id)
 
 
-def rating_answer(rating: Any) -> str:
-    return clean_value(rating)
-
-
-def build_next_movie_title_prediction(
+def build_next_movie_prediction(
     user: dict[str, Any] | None,
     history: list[dict[str, Any]],
     target_movie_id: str,
@@ -216,16 +179,16 @@ def build_next_movie_title_prediction(
     rng: random.Random | None = None,
 ) -> RenderedExample:
     input_text = render_prompt_template(
-        "NextMovieTitlePrediction",
+        "NextMoviePrediction",
         rng,
         user_profile=format_user_profile(user),
-        history=format_title_interaction_history(history, movie_features),
-        title_only_suffix=TITLE_ONLY_SUFFIX,
+        history=format_id_interaction_history(history, movie_features),
+        movie_token_only_suffix=MOVIE_TOKEN_ONLY_SUFFIX,
     )
-    return RenderedExample(INSTRUCTION, input_text, movie_title_answer(target_movie_id, movie_features))
+    return RenderedExample(INSTRUCTION, input_text, movie_token_answer(target_movie_id, movie_features))
 
 
-def build_seq_title_to_feature(
+def build_seq_id_to_feature(
     user: dict[str, Any] | None,
     history: list[dict[str, Any]],
     target_movie_id: str,
@@ -233,55 +196,54 @@ def build_seq_title_to_feature(
     rng: random.Random | None = None,
 ) -> RenderedExample:
     input_text = render_prompt_template(
-        "Seq_Title2Feature",
+        "Seq_ID2Feature",
         rng,
         user_profile=format_user_profile(user),
-        history=format_title_interaction_history(history, movie_features),
+        history=format_id_interaction_history(history, movie_features),
     )
-    return RenderedExample(INSTRUCTION, input_text, movie_features.basic_text(target_movie_id))
+    return RenderedExample(INSTRUCTION, input_text, movie_features.full_feature(target_movie_id))
 
 
-def build_seq_rating(
+def build_seq_feature_to_id(
     user: dict[str, Any] | None,
-    train_history: list[dict[str, Any]],
-    candidate_movie_id: str,
-    candidate_rating: Any,
+    history: list[dict[str, Any]],
+    target_movie_id: str,
     movie_features: MovieFeatureStore,
     rng: random.Random | None = None,
 ) -> RenderedExample:
     input_text = render_prompt_template(
-        "Seq_Rating",
+        "Seq_Feature2ID",
         rng,
         user_profile=format_user_profile(user),
-        history=format_title_interaction_history(train_history, movie_features),
-        candidate_title=movie_features.title(candidate_movie_id),
-        rating_only_suffix=RATING_ONLY_SUFFIX,
+        history=format_id_interaction_history(history, movie_features),
+        movie_feature=movie_features.full_feature(target_movie_id),
+        movie_token_only_suffix=MOVIE_TOKEN_ONLY_SUFFIX,
     )
-    return RenderedExample(INSTRUCTION, input_text, rating_answer(candidate_rating))
+    return RenderedExample(INSTRUCTION, input_text, movie_token_answer(target_movie_id, movie_features))
 
 
-def build_single_title_to_feature(
+def build_id_to_feature(
     movie_id: str,
     movie_features: MovieFeatureStore,
     rng: random.Random | None = None,
 ) -> RenderedExample:
     input_text = render_prompt_template(
-        "Single_Title2Feature",
+        "ID2Feature",
         rng,
-        movie_title=movie_features.title(movie_id),
+        movie_token=movie_features.token(movie_id),
     )
-    return RenderedExample(INSTRUCTION, input_text, movie_features.feature_text(movie_id))
+    return RenderedExample(INSTRUCTION, input_text, movie_features.full_feature(movie_id))
 
 
-def build_single_feature_to_title(
+def build_feature_to_id(
     movie_id: str,
     movie_features: MovieFeatureStore,
     rng: random.Random | None = None,
 ) -> RenderedExample:
     input_text = render_prompt_template(
-        "Single_Feature2Title",
+        "Feature2ID",
         rng,
-        movie_text=movie_features.full_feature(movie_id),
-        title_only_suffix=TITLE_ONLY_SUFFIX,
+        movie_feature=movie_features.full_feature(movie_id),
+        movie_token_only_suffix=MOVIE_TOKEN_ONLY_SUFFIX,
     )
-    return RenderedExample(INSTRUCTION, input_text, movie_title_answer(movie_id, movie_features))
+    return RenderedExample(INSTRUCTION, input_text, movie_token_answer(movie_id, movie_features))

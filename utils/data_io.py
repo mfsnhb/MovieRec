@@ -7,32 +7,21 @@ from typing import Any, Iterable, Mapping
 import pandas as pd
 
 
-_TITLE_FEATURE_COLUMNS = frozenset({"movie_id", "title"})
-_BASIC_TEXT_FEATURE_COLUMNS = frozenset({"movie_id", "title", "genres", "description"})
-_FULL_FEATURE_COLUMNS = frozenset(
-    {
-        "movie_id",
-        "title",
-        "genres",
-        "description",
-        "isAdult",
-        "runtimeMinutes",
-        "averageRating",
-        "numVotes",
-    }
-)
+_MOVIE_ID_PREFIX = "movie_"
+MOVIE_ID_FEATURE_COLUMNS = frozenset({"movie_id", "title"})
+_TEXT_FEATURE_COLUMNS = frozenset({"movie_id", "title", "genres", "description"})
 
 _MOVIE_FEATURE_COLUMNS_BY_TASK = {
-    "NextMovieTitlePrediction": _TITLE_FEATURE_COLUMNS,
-    "Seq_Title2Feature": _BASIC_TEXT_FEATURE_COLUMNS,
-    "Seq_Rating": _TITLE_FEATURE_COLUMNS,
-    "Single_Title2Feature": _BASIC_TEXT_FEATURE_COLUMNS,
-    "Single_Feature2Title": _FULL_FEATURE_COLUMNS,
+    "NextMoviePrediction": MOVIE_ID_FEATURE_COLUMNS,
+    "Seq_ID2Feature": _TEXT_FEATURE_COLUMNS,
+    "Seq_Feature2ID": _TEXT_FEATURE_COLUMNS,
+    "ID2Feature": _TEXT_FEATURE_COLUMNS,
+    "Feature2ID": _TEXT_FEATURE_COLUMNS,
 }
 
 
 _DEFAULT_REQUIRED_COLUMNS = {
-    "movies.pkl": {"movie_id", "title"},
+    "movies.pkl": set(MOVIE_ID_FEATURE_COLUMNS),
     "ratings.pkl": {"user_id", "movie_id", "rating", "timestamp"},
     "users.pkl": {"user_id", "gender", "age", "occupation"},
 }
@@ -50,6 +39,10 @@ def clean_value(value: Any) -> str:
 def movie_id_sort_key(movie_id: Any) -> tuple[int, int | str]:
     text = clean_value(movie_id)
     return (0, int(text)) if text.isdigit() else (1, text)
+
+
+def movie_token(movie_id: Any) -> str:
+    return f"{_MOVIE_ID_PREFIX}{clean_value(movie_id)}"
 
 
 def required_movie_feature_columns(tasks: Iterable[str]) -> set[str]:
@@ -87,6 +80,20 @@ class MovieFeatureStore:
     def movie_id_set(self) -> set[str]:
         return set(self.features_by_id)
 
+    @property
+    def movie_tokens(self) -> tuple[str, ...]:
+        return tuple(movie_token(movie_id) for movie_id in self.movie_ids)
+
+    @property
+    def movie_token_to_id(self) -> dict[str, str]:
+        return {movie_token(movie_id): movie_id for movie_id in self.movie_ids}
+
+    def token(self, movie_id: Any) -> str:
+        normalized_id = clean_value(movie_id)
+        if normalized_id not in self.features_by_id:
+            raise KeyError(f"Unknown MovieLens movie_id: {normalized_id}")
+        return movie_token(normalized_id)
+
     def get(self, movie_id: Any) -> dict[str, Any]:
         normalized_id = clean_value(movie_id)
         try:
@@ -100,36 +107,32 @@ class MovieFeatureStore:
     def title(self, movie_id: Any) -> str:
         return clean_value(self.get(movie_id).get("title"))
 
-    def basic_text(self, movie_id: Any) -> str:
-        movie = self.get(movie_id)
-        return (
-            f"The movie is {clean_value(movie.get('title'))}. "
-            f"It belongs to the {self.genres(movie_id)} genre(s). "
-            f"Its description is: {clean_value(movie.get('description'))}"
-        )
-
-    def feature_text(self, movie_id: Any) -> str:
-        movie = self.get(movie_id)
-        return (
-            f"The genre(s) are {self.genres(movie_id)}. "
-            f"The description is: {clean_value(movie.get('description'))}"
-        )
-
     def full_feature(self, movie_id: Any) -> str:
         movie = self.get(movie_id)
-        adult = clean_value(movie.get("isAdult"))
-        if adult in {"1", "1.0", "True", "true"}:
-            adult_text = "adult-oriented"
-        elif adult in {"0", "0.0", "False", "false"}:
-            adult_text = "not adult-oriented"
+        title = clean_value(movie.get("title"))
+        genres = self.genres(movie_id)
+        description = clean_value(movie.get("description")).rstrip(".")
+        if description == "Unknown":
+            story_sentence = "No story summary is available."
         else:
-            adult_text = f"adult flag is {adult}"
-        return (
-            f"This movie is {adult_text} with genre(s) {self.genres(movie_id)}. "
-            f"The runtime is {clean_value(movie.get('runtimeMinutes'))} minutes, and its external average rating is "
-            f"{clean_value(movie.get('averageRating'))} based on {clean_value(movie.get('numVotes'))} votes. "
-            f"Description: {clean_value(movie.get('description'))}"
+            story_sentence = f"Its story follows this premise: {description}."
+
+        return " ".join(
+            [
+                f"{title} is listed under the {genres} genres.",
+                story_sentence,
+            ]
         )
+
+    def token_records(self) -> list[dict[str, str]]:
+        return [
+            {
+                "movie_id": movie_id,
+                "movie_token": movie_token(movie_id),
+                "title": self.title(movie_id),
+            }
+            for movie_id in self.movie_ids
+        ]
 
 
 def load_dataframe(raw_dir: Path, name: str, required_columns: set[str] | None = None) -> pd.DataFrame:

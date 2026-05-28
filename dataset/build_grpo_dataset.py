@@ -10,8 +10,8 @@ from typing import Any, Iterable
 from dataset.build_sft_dataset import LEAVE_ONE_OUT_SPLITS, loo_targets
 from dataset.sft_schema import (
     INSTRUCTION,
-    TITLE_ONLY_SUFFIX,
-    format_title_interaction_history,
+    MOVIE_TOKEN_ONLY_SUFFIX,
+    format_id_interaction_history,
     format_user_profile,
 )
 from utils.data_io import (
@@ -29,7 +29,7 @@ GRPO_INSTRUCTION = INSTRUCTION
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build title-based MovieRec GRPO prompt JSONL data.")
+    parser = argparse.ArgumentParser(description="Build MovieRec GRPO prompt JSONL data with Movie ID tokens.")
     parser.add_argument("--raw-dir", type=Path, default=Path("data/raw/funrec-movielens-1m"))
     parser.add_argument("--out-dir", type=Path, default=Path("data/processed/grpo_movielens_1m"))
     parser.add_argument("--min-history", type=int, default=3)
@@ -47,10 +47,10 @@ def build_prompt(
     prompt_input = f"""User profile:
 {format_user_profile(user)}
 
-The user's MovieLens history is listed below as movie title and rating:
-{format_title_interaction_history(history, movie_features)}
+Here is the user's recent MovieLens trail. Each line names a movie by its catalog token and shows how the user rated it:
+{format_id_interaction_history(history, movie_features)}
 
-Based on this profile and rating history, recommend the movie the user is most likely to watch next. {TITLE_ONLY_SUFFIX}"""
+Use the profile and the pattern in these ratings to choose the movie this user is most likely to watch next. {MOVIE_TOKEN_ONLY_SUFFIX}"""
     return f"""{GRPO_INSTRUCTION}
 
 ### Input:
@@ -74,7 +74,7 @@ def main() -> None:
         shutil.rmtree(args.out_dir)
     ensure_dir(args.out_dir)
 
-    movie_features = load_movie_feature_store(args.raw_dir, required_movie_feature_columns({"NextMovieTitlePrediction"}))
+    movie_features = load_movie_feature_store(args.raw_dir, required_movie_feature_columns({"NextMoviePrediction"}))
     users = load_user_profiles(args.raw_dir)
     ratings_df = load_ratings(args.raw_dir, movie_features)
     user_ids = list(ratings_df["user_id"].drop_duplicates())
@@ -96,11 +96,11 @@ def main() -> None:
                     "id": f"grpo:user_{user_id}:loo_{split}:pos_{target_pos}",
                     "split": split,
                     "prompt": build_prompt(users.get(user_id), history, movie_features),
-                    "target_movie_title": movie_features.title(target_movie_id),
+                    "target_movie_token": movie_features.token(target_movie_id),
                     "user_id": clean_value(user_id),
                     "target_movie_id": target_movie_id,
+                    "history_movie_tokens": [movie_features.token(event["movie_id"]) for event in history],
                     "history_movie_ids": [clean_value(event["movie_id"]) for event in history],
-                    "history_movie_titles": [movie_features.title(event["movie_id"]) for event in history],
                     "history_ratings": [clean_value(event["rating"]) for event in history],
                     "source": SOURCE,
                 }
@@ -109,6 +109,7 @@ def main() -> None:
     counts = Counter({split: len(records) for split, records in outputs.items()})
     for split, records in outputs.items():
         write_jsonl(args.out_dir / f"{split}.jsonl", records)
+    save_json(args.out_dir / "movie_tokens.json", movie_features.token_records())
     save_json(
         args.out_dir / "manifest.json",
         {
@@ -116,7 +117,7 @@ def main() -> None:
             "raw_dir": str(args.raw_dir),
             "min_history": args.min_history,
             "max_history": args.max_history,
-            "target_unit": "movie_title",
+            "target_unit": "movie_id_token",
             "sequence_split_protocol": "leave_one_out",
             "leave_one_out_splits": {split: f"target is the {offset} item from the end" for split, offset in LEAVE_ONE_OUT_SPLITS},
             "splits": dict(counts),

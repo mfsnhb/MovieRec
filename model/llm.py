@@ -86,6 +86,8 @@ def load_causal_lm(config: ModelConfig, tokenizer=None):
     if config.attn_implementation:
         kwargs["attn_implementation"] = config.attn_implementation
     model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
+    if tokenizer is not None and len(tokenizer) > model.get_input_embeddings().num_embeddings:
+        model.resize_token_embeddings(len(tokenizer))
     if base_model_path is not None:
         model = PeftModel.from_pretrained(model, str(adapter_path), is_trainable=config.adapter_is_trainable)
     model.config.use_cache = False

@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
-import string
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,61 +11,51 @@ import torch
 from dataset.build_sft_dataset import loo_targets
 from dataset.sft_schema import (
     INSTRUCTION,
-    TITLE_ONLY_SUFFIX,
-    format_title_interaction_history,
+    MOVIE_TOKEN_ONLY_SUFFIX,
+    format_id_interaction_history,
     format_user_profile,
 )
 from model.llm import ModelConfig, load_causal_lm, load_tokenizer
 from utils.data_io import (
+    MovieFeatureStore,
     clean_value,
     load_movie_feature_store,
     load_ratings,
     load_user_profiles,
-    required_movie_feature_columns,
 )
 from utils.training_utils import ensure_dir, setup_seed
 
 
 RECOMMENDATION_INSTRUCTION = INSTRUCTION
-_TITLE_STRIP_CHARS = string.whitespace + "\"'`.,;:!?，。；：！？"
 
 
 @dataclass(frozen=True)
-class GenerationConfig:
+class RankingConfig:
     top_k: int = 10
-    max_new_tokens: int = 48
 
 
 @dataclass(frozen=True)
 class InferenceComponents:
     tokenizer: Any
     model: Any
-    valid_title_by_normalized: dict[str, str]
-
-
-def normalize_title_text(text: str) -> str:
-    text = clean_value(text).lower()
-    text = text.replace("&", "and")
-    text = re.sub(r"\s+", " ", text)
-    return text.strip(_TITLE_STRIP_CHARS)
-
-
-def build_title_lookup(valid_titles: list[str]) -> dict[str, str]:
-    return {normalize_title_text(title): title for title in valid_titles}
+    movie_ids: list[str]
+    movie_tokens: list[str]
+    movie_token_ids: list[int]
+    movie_id_to_index: dict[str, int]
 
 
 def build_recommendation_prompt(
     user: dict[str, Any] | None,
     history: list[dict[str, Any]],
-    movie_features,
+    movie_features: MovieFeatureStore,
 ) -> str:
     prompt_input = f"""User profile:
 {format_user_profile(user)}
 
-The user's MovieLens history is listed below as movie title and rating:
-{format_title_interaction_history(history, movie_features)}
+Here is the user's recent MovieLens trail. Each line names a movie by its catalog token and shows how the user rated it:
+{format_id_interaction_history(history, movie_features)}
 
-Based on this profile and rating history, recommend the movie the user is most likely to watch next. {TITLE_ONLY_SUFFIX}"""
+Use the profile and the pattern in these ratings to choose the movie this user is most likely to watch next. {MOVIE_TOKEN_ONLY_SUFFIX}"""
     return f"""{RECOMMENDATION_INSTRUCTION}
 
 ### Input:
@@ -79,11 +67,13 @@ Based on this profile and rating history, recommend the movie the user is most l
 
 def load_inference_components(
     model_name_or_path: str,
-    valid_titles: list[str],
+    movie_features: MovieFeatureStore,
     load_in_4bit: bool = True,
     attn_implementation: str | None = None,
 ) -> InferenceComponents:
     tokenizer = load_tokenizer(model_name_or_path, padding_side="left")
+    movie_tokens = list(movie_features.movie_tokens)
+    tokenizer.add_tokens(movie_tokens, special_tokens=False)
     model = load_causal_lm(
         ModelConfig(
             model_name_or_path,
@@ -93,103 +83,92 @@ def load_inference_components(
         tokenizer=tokenizer,
     )
     model.eval()
-    valid_title_by_normalized = build_title_lookup(valid_titles)
+    movie_token_ids = [int(token_id) for token_id in tokenizer.convert_tokens_to_ids(movie_tokens)]
+    movie_ids = list(movie_features.movie_ids)
     return InferenceComponents(
         tokenizer=tokenizer,
         model=model,
-        valid_title_by_normalized=valid_title_by_normalized,
+        movie_ids=movie_ids,
+        movie_tokens=movie_tokens,
+        movie_token_ids=movie_token_ids,
+        movie_id_to_index={movie_id: index for index, movie_id in enumerate(movie_ids)},
     )
 
 
-def _split_candidate_fragments(text: str) -> list[str]:
-    fragments = [text]
-    fragments.extend(text.splitlines())
-    fragments.extend(re.split(r"\s*(?:\d+[\).\s]+|[-*•]\s+|,|;)\s*", text))
-    return [fragment.strip(_TITLE_STRIP_CHARS) for fragment in fragments if fragment.strip(_TITLE_STRIP_CHARS)]
+def last_non_padding_indices(attention_mask: torch.Tensor) -> torch.Tensor:
+    reversed_mask = attention_mask.flip(dims=[1])
+    distance_from_end = reversed_mask.long().argmax(dim=1)
+    return attention_mask.shape[1] - 1 - distance_from_end
 
 
-def extract_valid_titles(
-    text: str,
-    valid_title_by_normalized: dict[str, str],
-    excluded_titles: set[str] | None = None,
-) -> list[str]:
-    excluded = {normalize_title_text(title) for title in excluded_titles or set()}
-    seen: set[str] = set()
-    matches: list[str] = []
-
-    def add(normalized: str) -> None:
-        title = valid_title_by_normalized.get(normalized)
-        if title is None or normalized in excluded or title in seen:
-            return
-        seen.add(title)
-        matches.append(title)
-
-    for fragment in _split_candidate_fragments(text):
-        add(normalize_title_text(fragment))
-    return matches
-
-
-def generate_title_recommendations_batch(
+def rank_movie_recommendations_batch(
     components: InferenceComponents,
     prompts: list[str],
-    generation_config: GenerationConfig,
-    excluded_titles: list[set[str] | None] | None = None,
+    ranking_config: RankingConfig,
+    excluded_movie_ids: list[set[str] | None] | None = None,
 ) -> list[dict[str, Any]]:
     if not prompts:
         return []
     tokenizer = components.tokenizer
     model = components.model
-    top_k = max(1, generation_config.top_k)
+    top_k = max(1, ranking_config.top_k)
     inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(model.device)
+    movie_token_ids = torch.tensor(components.movie_token_ids, device=model.device, dtype=torch.long)
     with torch.no_grad():
-        generated = model.generate(
-            **inputs,
-            max_new_tokens=generation_config.max_new_tokens,
-            do_sample=False,
-            num_beams=top_k,
-            num_return_sequences=top_k,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
-    prompt_width = inputs["input_ids"].shape[1]
-    decoded = tokenizer.batch_decode(generated[:, prompt_width:], skip_special_tokens=True)
+        outputs = model(**inputs)
+        row_indices = torch.arange(inputs["input_ids"].shape[0], device=model.device)
+        last_indices = last_non_padding_indices(inputs["attention_mask"])
+        next_token_logits = outputs.logits[row_indices, last_indices, :]
+        movie_scores = next_token_logits.index_select(dim=-1, index=movie_token_ids)
+
+    if excluded_movie_ids is not None:
+        movie_scores = movie_scores.clone()
+        for row, excluded in enumerate(excluded_movie_ids):
+            if not excluded:
+                continue
+            for movie_id in excluded:
+                index = components.movie_id_to_index.get(clean_value(movie_id))
+                if index is not None:
+                    movie_scores[row, index] = -torch.inf
+
+    top_count = min(top_k, movie_scores.shape[1])
+    top_scores, top_indices = torch.topk(movie_scores, top_count, dim=1)
     results: list[dict[str, Any]] = []
     for row in range(len(prompts)):
-        raw_generations = decoded[row * top_k : (row + 1) * top_k]
-        row_excluded = excluded_titles[row] if excluded_titles else None
-        predicted_titles: list[str] = []
-        for text in raw_generations:
-            for title in extract_valid_titles(
-                text,
-                components.valid_title_by_normalized,
-                row_excluded,
-            ):
-                if title not in predicted_titles:
-                    predicted_titles.append(title)
-            if len(predicted_titles) >= top_k:
-                break
+        predicted_movie_ids: list[str] = []
+        predicted_movie_tokens: list[str] = []
+        scores: list[float] = []
+        for score, index in zip(top_scores[row].tolist(), top_indices[row].tolist(), strict=True):
+            if score == float("-inf"):
+                continue
+            predicted_movie_ids.append(components.movie_ids[index])
+            predicted_movie_tokens.append(components.movie_tokens[index])
+            scores.append(float(score))
         results.append(
             {
-                "generations": raw_generations,
-                "predicted_movie_titles": predicted_titles[:top_k],
+                "predicted_movie_ids": predicted_movie_ids,
+                "predicted_movie_tokens": predicted_movie_tokens,
+                "scores": scores,
             }
         )
     return results
 
 
-def generate_title_recommendations(
+def rank_movie_recommendations(
     components: InferenceComponents,
     prompt: str,
-    generation_config: GenerationConfig,
-    excluded_titles: set[str] | None = None,
+    ranking_config: RankingConfig,
+    excluded_movie_ids: set[str] | None = None,
 ) -> dict[str, Any]:
-    return generate_title_recommendations_batch(components, [prompt], generation_config, [excluded_titles])[0]
+    return rank_movie_recommendations_batch(components, [prompt], ranking_config, [excluded_movie_ids])[0]
 
 
 def prediction_record(
     user_id: str,
     split: str,
     target_pos: int,
+    target_movie_id: str,
+    target_movie_token: str,
     target_movie_title: str,
     prediction: dict[str, Any],
     rank: int | None = None,
@@ -198,9 +177,12 @@ def prediction_record(
         "user_id": user_id,
         "split": split,
         "target_position": target_pos,
+        "target_movie_id": target_movie_id,
+        "target_movie_token": target_movie_token,
         "target_movie_title": target_movie_title,
-        "predicted_movie_titles": prediction["predicted_movie_titles"],
-        "generations": prediction["generations"],
+        "predicted_movie_ids": prediction["predicted_movie_ids"],
+        "predicted_movie_tokens": prediction["predicted_movie_tokens"],
+        "scores": prediction["scores"],
     }
     if rank is not None:
         record["rank"] = rank
@@ -208,7 +190,7 @@ def prediction_record(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run MovieRec title-based inference.")
+    parser = argparse.ArgumentParser(description="Run MovieRec movie ID token inference.")
     parser.add_argument("--model-name-or-path", required=True)
     parser.add_argument("--raw-dir", type=Path, default=Path("data/raw/funrec-movielens-1m"))
     parser.add_argument("--output-path", type=Path, default=Path("outputs/inference/predictions.jsonl"))
@@ -217,7 +199,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-history", type=int, default=50)
     parser.add_argument("--split", choices=["train", "valid", "test"], default="test")
     parser.add_argument("--top-k", type=int, default=10)
-    parser.add_argument("--max-new-tokens", type=int, default=48)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--load-in-4bit", action=argparse.BooleanOptionalAction, default=True)
@@ -230,17 +211,16 @@ def main() -> None:
     setup_seed(args.seed)
     ensure_dir(args.output_path.parent)
 
-    movie_features = load_movie_feature_store(args.raw_dir, required_movie_feature_columns({"NextMovieTitlePrediction"}))
+    movie_features = load_movie_feature_store(args.raw_dir, {"movie_id", "title"})
     users = load_user_profiles(args.raw_dir)
     ratings_df = load_ratings(args.raw_dir, movie_features)
-    valid_titles = [movie_features.title(movie_id) for movie_id in movie_features.movie_ids]
     components = load_inference_components(
         args.model_name_or_path,
-        valid_titles,
+        movie_features,
         args.load_in_4bit,
         args.attn_implementation,
     )
-    generation_config = GenerationConfig(top_k=args.top_k, max_new_tokens=args.max_new_tokens)
+    ranking_config = RankingConfig(top_k=args.top_k)
 
     grouped = ratings_df.groupby("user_id", sort=False)
     with args.output_path.open("w", encoding="utf-8") as handle:
@@ -249,11 +229,11 @@ def main() -> None:
         def flush_pending() -> None:
             if not pending:
                 return
-            predictions = generate_title_recommendations_batch(
+            predictions = rank_movie_recommendations_batch(
                 components,
                 [str(item["prompt"]) for item in pending],
-                generation_config,
-                [item["history_titles"] for item in pending],  # type: ignore[list-item]
+                ranking_config,
+                [item["history_movie_ids"] for item in pending],  # type: ignore[list-item]
             )
             for item, prediction in zip(pending, predictions, strict=True):
                 handle.write(
@@ -262,6 +242,8 @@ def main() -> None:
                             str(item["user_id"]),
                             str(item["split"]),
                             int(item["target_pos"]),
+                            str(item["target_movie_id"]),
+                            str(item["target_movie_token"]),
                             str(item["target_movie_title"]),
                             prediction,
                         ),
@@ -284,15 +266,16 @@ def main() -> None:
                     continue
                 target_movie_id = clean_value(target["movie_id"])
                 prompt = build_recommendation_prompt(users.get(user_id), history, movie_features)
-                history_titles = {movie_features.title(event["movie_id"]) for event in history}
                 pending.append(
                     {
                         "user_id": user_id,
                         "split": split,
                         "target_pos": target_pos,
+                        "target_movie_id": target_movie_id,
+                        "target_movie_token": movie_features.token(target_movie_id),
                         "target_movie_title": movie_features.title(target_movie_id),
                         "prompt": prompt,
-                        "history_titles": history_titles,
+                        "history_movie_ids": {clean_value(event["movie_id"]) for event in history},
                     }
                 )
                 if len(pending) >= args.batch_size:
