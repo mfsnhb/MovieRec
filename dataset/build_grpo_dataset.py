@@ -10,8 +10,8 @@ from typing import Any, Iterable
 from dataset.build_sft_dataset import LEAVE_ONE_OUT_SPLITS, loo_targets
 from dataset.sft_schema import (
     INSTRUCTION,
-    MOVIE_TOKEN_ONLY_SUFFIX,
-    format_id_interaction_history,
+    MOVIE_TOKEN_LIST_SUFFIX,
+    format_id_title_interaction_history,
     format_user_profile,
 )
 from utils.data_io import (
@@ -35,6 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-history", type=int, default=3)
     parser.add_argument("--max-history", type=int, default=50)
     parser.add_argument("--max-users", type=int)
+    parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -43,14 +44,15 @@ def build_prompt(
     user: dict[str, Any] | None,
     history: Iterable[dict[str, Any]],
     movie_features,
+    top_k: int,
 ) -> str:
     prompt_input = f"""User profile:
 {format_user_profile(user)}
 
-Here is the user's recent MovieLens trail. Each line names a movie by its catalog token and shows how the user rated it:
-{format_id_interaction_history(history, movie_features)}
+Here is the user's recent MovieLens trail. Each line names a movie by its catalog token and title:
+{format_id_title_interaction_history(history, movie_features)}
 
-Use the profile and the pattern in these ratings to choose the movie this user is most likely to watch next. {MOVIE_TOKEN_ONLY_SUFFIX}"""
+Use the profile and the pattern in this movie sequence to recommend the next movies this user is likely to watch. {MOVIE_TOKEN_LIST_SUFFIX.format(k=top_k)}"""
     return f"""{GRPO_INSTRUCTION}
 
 ### Input:
@@ -95,13 +97,15 @@ def main() -> None:
                 {
                     "id": f"grpo:user_{user_id}:loo_{split}:pos_{target_pos}",
                     "split": split,
-                    "prompt": build_prompt(users.get(user_id), history, movie_features),
+                    "prompt": build_prompt(users.get(user_id), history, movie_features, args.top_k),
                     "target_movie_token": movie_features.token(target_movie_id),
+                    "target_movie_title": movie_features.title(target_movie_id),
+                    "target_movie_output": f"1. {movie_features.token(target_movie_id)} | {movie_features.title(target_movie_id)}",
                     "user_id": clean_value(user_id),
                     "target_movie_id": target_movie_id,
                     "history_movie_tokens": [movie_features.token(event["movie_id"]) for event in history],
                     "history_movie_ids": [clean_value(event["movie_id"]) for event in history],
-                    "history_ratings": [clean_value(event["rating"]) for event in history],
+                    "top_k": args.top_k,
                     "source": SOURCE,
                 }
             )
@@ -117,7 +121,8 @@ def main() -> None:
             "raw_dir": str(args.raw_dir),
             "min_history": args.min_history,
             "max_history": args.max_history,
-            "target_unit": "movie_id_token",
+            "target_unit": "ranked_movie_id_title_list",
+            "top_k": args.top_k,
             "sequence_split_protocol": "leave_one_out",
             "leave_one_out_splits": {split: f"target is the {offset} item from the end" for split, offset in LEAVE_ONE_OUT_SPLITS},
             "splits": dict(counts),

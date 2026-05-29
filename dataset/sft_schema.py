@@ -32,46 +32,48 @@ USER_PROFILE_TASKS = {"NextMoviePrediction", "Seq_ID2Feature", "Seq_Feature2ID"}
 
 INSTRUCTION = (
     "You are a helpful movie recommendation assistant. Use the user's profile, "
-    "MovieLens movie ID tokens, ratings, and movie information to make clear predictions."
+    "MovieLens movie ID tokens and movie information to make clear predictions."
 )
 MOVIE_TOKEN_ONLY_SUFFIX = "Answer with exactly one MovieLens movie ID token, such as movie_1, and no other words."
+MOVIE_TOKEN_LIST_SUFFIX = "Answer with exactly {k} ranked movies, one per line, in the format: 1. movie_1 | Movie Title. Do not output any other words."
+CANDIDATE_MOVIE_TOKEN_ONLY_SUFFIX = "Answer with exactly one candidate movie in the format: movie_1 | Movie Title. Do not output any other words."
 
 PROMPT_TEMPLATES = {
     "NextMoviePrediction": [
         """User profile:
 {user_profile}
 
-Here is the user's recent MovieLens trail. Each line names a movie by its catalog token and shows how the user rated it:
+Here is the user's recent MovieLens trail. Each line names a movie by its catalog token and title:
 {history}
 
-Use the profile and the pattern in these ratings to choose the movie this user is most likely to watch next. {movie_token_only_suffix}""",
+Use the profile and the pattern in this movie sequence to recommend the next movies this user is likely to watch. {movie_token_list_suffix}""",
         """The user can be described as follows:
 {user_profile}
 
-Below is the user's viewing sequence in watch order. Each movie is represented by its MovieLens ID token, followed by the user's rating:
+Below is the user's viewing sequence in watch order. Each movie is represented by its MovieLens ID token and title:
 {history}
 
-Infer the next movie that best fits this user's taste. {movie_token_only_suffix}""",
+Infer a ranked list of future movies that best fits this user's taste. {movie_token_list_suffix}""",
         """Profile:
 {user_profile}
 
-The user's past ratings form this movie trail:
+The user's movie trail is:
 {history}
 
-Based on the profile and this trail, choose the next MovieLens movie token for the user. {movie_token_only_suffix}""",
+Based on the profile and this trail, recommend the next MovieLens movie tokens for the user. {movie_token_list_suffix}""",
         """Consider this user's profile:
 {user_profile}
 
-Their recent ratings are shown below. The token identifies the movie, and the stars show the user's preference:
+Their recent movies are shown below in watch order:
 {history}
 
-Recommend the next movie that matches this user's observed preferences. {movie_token_only_suffix}""",
+Recommend a ranked list of movies that matches this user's observed preferences. {movie_token_list_suffix}""",
     ],
     "Seq_ID2Feature": [
         """User profile:
 {user_profile}
 
-Recent movies this user watched, in order, with ratings:
+Recent movies this user watched, in order:
 {history}
 
 Based on this user's taste, describe the next movie they would probably like. Include the movie title, genres, and a brief story summary.""",
@@ -87,7 +89,7 @@ Write a short catalog-style description of the movie that should come next for t
         """User profile:
 {user_profile}
 
-Recent movies this user watched, in order, with ratings:
+Recent movies this user watched, in order:
 {history}
 
 The next movie is described as:
@@ -162,8 +164,23 @@ def format_id_interaction_history(history: Iterable[dict[str, Any]], movie_featu
     lines = []
     for event in history:
         movie_id = clean_value(event.get("movie_id"))
-        rating = clean_value(event.get("rating"))
-        lines.append(f"- {movie_features.token(movie_id)} | rating: {rating}")
+        lines.append(f"- {movie_features.token(movie_id)}")
+    return "\n".join(lines)
+
+
+def format_id_title_interaction_history(history: Iterable[dict[str, Any]], movie_features: MovieFeatureStore) -> str:
+    lines = []
+    for event in history:
+        movie_id = clean_value(event.get("movie_id"))
+        lines.append(f"- {movie_features.token(movie_id)} | {movie_features.title(movie_id)}")
+    return "\n".join(lines)
+
+
+def format_candidate_movies(candidate_movie_ids: Iterable[str], movie_features: MovieFeatureStore) -> str:
+    lines = []
+    for index, movie_id in enumerate(candidate_movie_ids, 1):
+        normalized_id = clean_value(movie_id)
+        lines.append(f"{index}. {movie_features.token(normalized_id)} | {movie_features.title(normalized_id)}")
     return "\n".join(lines)
 
 
@@ -171,21 +188,37 @@ def movie_token_answer(movie_id: Any, movie_features: MovieFeatureStore) -> str:
     return movie_features.token(movie_id)
 
 
+def movie_token_title_answer(movie_id: Any, movie_features: MovieFeatureStore) -> str:
+    normalized_id = clean_value(movie_id)
+    return f"{movie_features.token(normalized_id)} | {movie_features.title(normalized_id)}"
+
+
+def movie_token_list_answer(movie_ids: Iterable[Any], movie_features: MovieFeatureStore) -> str:
+    lines = []
+    for index, movie_id in enumerate(movie_ids, 1):
+        normalized_id = clean_value(movie_id)
+        lines.append(f"{index}. {movie_features.token(normalized_id)} | {movie_features.title(normalized_id)}")
+    return "\n".join(lines)
+
+
 def build_next_movie_prediction(
     user: dict[str, Any] | None,
     history: list[dict[str, Any]],
-    target_movie_id: str,
+    target_movie_ids: str | list[str],
     movie_features: MovieFeatureStore,
     rng: random.Random | None = None,
 ) -> RenderedExample:
+    if isinstance(target_movie_ids, str):
+        target_movie_ids = [target_movie_ids]
+    output_k = len(target_movie_ids)
     input_text = render_prompt_template(
         "NextMoviePrediction",
         rng,
         user_profile=format_user_profile(user),
-        history=format_id_interaction_history(history, movie_features),
-        movie_token_only_suffix=MOVIE_TOKEN_ONLY_SUFFIX,
+        history=format_id_title_interaction_history(history, movie_features),
+        movie_token_list_suffix=MOVIE_TOKEN_LIST_SUFFIX.format(k=output_k),
     )
-    return RenderedExample(INSTRUCTION, input_text, movie_token_answer(target_movie_id, movie_features))
+    return RenderedExample(INSTRUCTION, input_text, movie_token_list_answer(target_movie_ids, movie_features))
 
 
 def build_seq_id_to_feature(

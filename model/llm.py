@@ -46,12 +46,17 @@ def build_quantization_config(config: ModelConfig) -> BitsAndBytesConfig | None:
     )
 
 
+def hf_model_path(model_name_or_path: Path | str) -> str:
+    path = Path(model_name_or_path)
+    return str(path) if path.exists() else str(model_name_or_path)
+
+
 def load_tokenizer(
     model_name_or_path: str,
     trust_remote_code: bool = True,
     padding_side: Literal["left", "right"] = "right",
 ):
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
+    tokenizer = AutoTokenizer.from_pretrained(hf_model_path(model_name_or_path), trust_remote_code=trust_remote_code)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = padding_side
@@ -77,7 +82,7 @@ def adapter_base_model_path(model_name_or_path: Path | str) -> str | None:
 def load_causal_lm(config: ModelConfig, tokenizer=None):
     adapter_path = Path(config.model_name_or_path)
     base_model_path = adapter_base_model_path(adapter_path)
-    model_path = base_model_path or config.model_name_or_path
+    model_path = hf_model_path(base_model_path or config.model_name_or_path)
     kwargs = {
         "quantization_config": build_quantization_config(config),
         "device_map": "auto",

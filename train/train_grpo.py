@@ -14,10 +14,12 @@ from transformers import TrainerCallback
 
 from model.llm import ModelConfig, load_causal_lm, load_tokenizer
 from utils.data_io import load_movie_feature_store, required_movie_feature_columns
+from utils.reranker_scores import RerankerScores
 from utils.training_utils import Logger, ensure_dir, print_trainable_parameters, save_json, save_last_checkpoint_as_final, setup_seed
 
 
 MOVIE_TOKEN_RE = re.compile(r"\bmovie_\d+\b")
+NUMBERED_MOVIE_LINE_RE = re.compile(r"^\s*\d+\.\s*(movie_\d+)\s*\|\s*\S+", re.MULTILINE)
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", type=Path, default=Path("data/processed/grpo_movielens_1m"))
     parser.add_argument("--output-dir", type=Path, default=Path("models/grpo/qwen3_4b_QLoRA"))
     parser.add_argument("--logging-dir", type=Path, default=Path("outputs/grpo/qwen3_4b_QLoRA"))
-    parser.add_argument("--max-completion-length", type=int, default=4)
+    parser.add_argument("--max-completion-length", type=int, default=32)
     parser.add_argument("--num-generations", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--accumulation-steps", type=int, default=8)
@@ -53,10 +55,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--raw-dir", type=Path, default=Path("data/raw/funrec-movielens-1m"))
     parser.add_argument("--reranker-score-path", type=Path)
     parser.add_argument("--reranker-reward-weight", type=float, default=0.1)
-    parser.add_argument("--valid-token-reward", type=float, default=0.1)
+    parser.add_argument("--ndcg-reward-weight", type=float, default=1.0)
+    parser.add_argument("--exact-first-reward-weight", type=float, default=0.2)
+    parser.add_argument("--format-reward-weight", type=float, default=0.2)
+    parser.add_argument("--unique-list-reward-weight", type=float, default=0.2)
+    parser.add_argument("--valid-list-reward-weight", type=float, default=0.1)
     parser.add_argument("--invalid-token-penalty", type=float, default=-0.5)
     parser.add_argument("--history-token-penalty", type=float, default=-0.3)
-    parser.add_argument("--duplicate-token-penalty", type=float, default=-0.1)
     parser.add_argument("--resume-from-checkpoint", type=str)
     parser.add_argument("--use-wandb", action="store_true")
     parser.add_argument("--wandb-project", default="MovieRec")
@@ -135,18 +140,26 @@ def extract_completion_text(completion: Any) -> str:
 
 
 def extract_valid_movie_tokens(completion: Any, valid_movie_tokens: set[str]) -> list[str]:
-    seen: set[str] = set()
     tokens: list[str] = []
     for match in MOVIE_TOKEN_RE.finditer(extract_completion_text(completion)):
         token = match.group(0)
-        if token in valid_movie_tokens and token not in seen:
+        if token in valid_movie_tokens:
+            tokens.append(token)
+    return tokens
+
+
+def unique_valid_movie_tokens(completion: Any, valid_movie_tokens: set[str]) -> list[str]:
+    seen: set[str] = set()
+    tokens: list[str] = []
+    for token in extract_valid_movie_tokens(completion, valid_movie_tokens):
+        if token not in seen:
             seen.add(token)
             tokens.append(token)
     return tokens
 
 
 def first_valid_movie_token(completion: Any, valid_movie_tokens: set[str]) -> str | None:
-    tokens = extract_valid_movie_tokens(completion, valid_movie_tokens)
+    tokens = unique_valid_movie_tokens(completion, valid_movie_tokens)
     return tokens[0] if tokens else None
 
 
@@ -165,25 +178,6 @@ class RewardStats:
             print("REWARD_STATS", json.dumps(summary, ensure_ascii=False), flush=True)
 
 
-class RerankerScores:
-    def __init__(self, path: Path) -> None:
-        data = np.load(path, allow_pickle=False)
-        self.scores = data["scores"].astype(np.float32, copy=False)
-        user_ids = [str(value) for value in data["user_ids"].tolist()]
-        movie_ids = [str(value) for value in data["movie_ids"].tolist()]
-        self.user_to_row = {user_id: index for index, user_id in enumerate(user_ids)}
-        self.movie_to_col = {movie_id: index for index, movie_id in enumerate(movie_ids)}
-        order = np.argsort(np.argsort(self.scores, axis=1), axis=1).astype(np.float32)
-        self.percentiles = order / max(1, self.scores.shape[1] - 1)
-
-    def percentile(self, user_id: Any, movie_id: Any) -> float:
-        row = self.user_to_row.get(str(user_id))
-        col = self.movie_to_col.get(str(movie_id))
-        if row is None or col is None:
-            return 0.0
-        return float(self.percentiles[row, col])
-
-
 def build_movie_token_maps(raw_dir: Path) -> tuple[dict[str, str], set[str], list[str]]:
     movie_features = load_movie_feature_store(raw_dir, required_movie_feature_columns({"NextMoviePrediction"}))
     token_to_movie_id = movie_features.movie_token_to_id
@@ -191,69 +185,106 @@ def build_movie_token_maps(raw_dir: Path) -> tuple[dict[str, str], set[str], lis
     return token_to_movie_id, set(movie_tokens), movie_tokens
 
 
-def build_exact_match_reward(valid_movie_tokens: set[str]):
-    def exact_match_reward(completions: list[Any], target_movie_token: list[str], **_: Any) -> list[float]:
+def build_list_ndcg_reward(args: argparse.Namespace, valid_movie_tokens: set[str], stats: RewardStats):
+    def ndcg_reward(completions: list[Any], target_movie_token: list[str], **_: Any) -> list[float]:
+        rewards = []
+        hits = 0
+        ranks = []
+        for completion, target in zip(completions, target_movie_token):
+            tokens = unique_valid_movie_tokens(completion, valid_movie_tokens)
+            rank = tokens.index(target) + 1 if target in tokens else None
+            if rank is None:
+                rewards.append(0.0)
+                continue
+            hits += 1
+            ranks.append(rank)
+            rewards.append(args.ndcg_reward_weight / np.log2(rank + 1))
+        stats.add(ndcg_hit_rate=hits / max(1, len(completions)), ndcg_rank_mean=float(np.mean(ranks)) if ranks else 0.0, ndcg_reward_mean=float(np.mean(rewards)) if rewards else 0.0)
+        return rewards
+
+    return ndcg_reward
+
+
+def build_exact_first_reward(args: argparse.Namespace, valid_movie_tokens: set[str]):
+    def exact_first_reward(completions: list[Any], target_movie_token: list[str], **_: Any) -> list[float]:
         rewards = []
         for completion, target in zip(completions, target_movie_token):
-            token = first_valid_movie_token(completion, valid_movie_tokens)
-            rewards.append(1.0 if token == target else 0.0)
+            rewards.append(args.exact_first_reward_weight if first_valid_movie_token(completion, valid_movie_tokens) == target else 0.0)
         return rewards
 
-    return exact_match_reward
+    return exact_first_reward
 
 
-def build_validity_reward(
-    args: argparse.Namespace,
-    valid_movie_tokens: set[str],
-    stats: RewardStats,
-):
-    def validity_reward(completions: list[Any], history_movie_tokens: list[list[str]], **_: Any) -> list[float]:
+def build_format_reward(args: argparse.Namespace, valid_movie_tokens: set[str], stats: RewardStats):
+    def format_reward(completions: list[Any], top_k: list[int] | None = None, **_: Any) -> list[float]:
         rewards = []
-        valid_count = 0
-        history_count = 0
+        format_rates = []
+        for index, completion in enumerate(completions):
+            expected_k = int(top_k[index]) if top_k is not None else 10
+            text = extract_completion_text(completion)
+            lines = [line for line in text.splitlines() if line.strip()]
+            numbered = NUMBERED_MOVIE_LINE_RE.findall(text)
+            valid_numbered = [token for token in numbered if token in valid_movie_tokens]
+            rate = min(1.0, len(valid_numbered) / max(1, expected_k))
+            if lines and len(lines) > expected_k + 2:
+                rate *= 0.8
+            format_rates.append(rate)
+            rewards.append(args.format_reward_weight * rate)
+        stats.add(format_rate=float(np.mean(format_rates)) if format_rates else 0.0, format_reward_mean=float(np.mean(rewards)) if rewards else 0.0)
+        return rewards
+
+    return format_reward
+
+
+def build_unique_list_reward(args: argparse.Namespace, valid_movie_tokens: set[str], stats: RewardStats):
+    def unique_list_reward(completions: list[Any], top_k: list[int] | None = None, **_: Any) -> list[float]:
+        rewards = []
+        unique_rates = []
+        for index, completion in enumerate(completions):
+            expected_k = int(top_k[index]) if top_k is not None else 10
+            tokens = extract_valid_movie_tokens(completion, valid_movie_tokens)
+            unique_count = len(dict.fromkeys(tokens[:expected_k]))
+            rate = unique_count / max(1, expected_k)
+            unique_rates.append(rate)
+            rewards.append(args.unique_list_reward_weight * rate)
+        stats.add(unique_rate=float(np.mean(unique_rates)) if unique_rates else 0.0, unique_list_reward_mean=float(np.mean(rewards)) if rewards else 0.0)
+        return rewards
+
+    return unique_list_reward
+
+
+def build_list_validity_reward(args: argparse.Namespace, valid_movie_tokens: set[str], stats: RewardStats):
+    def list_validity_reward(completions: list[Any], top_k: list[int] | None = None, **_: Any) -> list[float]:
+        rewards = []
+        valid_rates = []
+        for index, completion in enumerate(completions):
+            expected_k = int(top_k[index]) if top_k is not None else 10
+            raw_tokens = MOVIE_TOKEN_RE.findall(extract_completion_text(completion))
+            valid_count = sum(token in valid_movie_tokens for token in raw_tokens[:expected_k])
+            rate = valid_count / max(1, min(expected_k, len(raw_tokens))) if raw_tokens else 0.0
+            valid_rates.append(rate)
+            rewards.append(args.valid_list_reward_weight * rate if raw_tokens else args.invalid_token_penalty)
+        stats.add(list_valid_rate=float(np.mean(valid_rates)) if valid_rates else 0.0, list_validity_reward_mean=float(np.mean(rewards)) if rewards else 0.0)
+        return rewards
+
+    return list_validity_reward
+
+
+def build_history_exclusion_reward(args: argparse.Namespace, valid_movie_tokens: set[str], stats: RewardStats):
+    def history_exclusion_reward(completions: list[Any], history_movie_tokens: list[list[str]], **_: Any) -> list[float]:
+        rewards = []
+        repeat_rates = []
         for completion, history_tokens in zip(completions, history_movie_tokens):
-            token = first_valid_movie_token(completion, valid_movie_tokens)
-            if token is None:
-                rewards.append(args.invalid_token_penalty)
-                continue
-            valid_count += 1
-            if token in set(history_tokens):
-                history_count += 1
-                rewards.append(args.history_token_penalty)
-            else:
-                rewards.append(args.valid_token_reward)
-        total = max(1, len(completions))
-        stats.add(valid_rate=valid_count / total, history_rate=history_count / total, validity_reward_mean=float(np.mean(rewards)) if rewards else 0.0)
+            tokens = unique_valid_movie_tokens(completion, valid_movie_tokens)
+            history = set(history_tokens)
+            repeat_count = sum(token in history for token in tokens)
+            repeat_rate = repeat_count / max(1, len(tokens)) if tokens else 0.0
+            repeat_rates.append(repeat_rate)
+            rewards.append(args.history_token_penalty * repeat_count)
+        stats.add(history_repeat_rate=float(np.mean(repeat_rates)) if repeat_rates else 0.0, history_exclusion_reward_mean=float(np.mean(rewards)) if rewards else 0.0)
         return rewards
 
-    return validity_reward
-
-
-def build_duplicate_token_reward(
-    args: argparse.Namespace,
-    valid_movie_tokens: set[str],
-    stats: RewardStats,
-):
-    def duplicate_token_reward(completions: list[Any], prompt: list[Any] | None = None, **_: Any) -> list[float]:
-        if prompt is None:
-            return [0.0] * len(completions)
-        rewards = [0.0] * len(completions)
-        duplicate_count = 0
-        group_tokens: dict[Any, set[str]] = {}
-        for index, (completion, prompt_text) in enumerate(zip(completions, prompt)):
-            token = first_valid_movie_token(completion, valid_movie_tokens)
-            if token is None:
-                continue
-            seen = group_tokens.setdefault(prompt_text, set())
-            if token in seen:
-                rewards[index] = args.duplicate_token_penalty
-                duplicate_count += 1
-            else:
-                seen.add(token)
-        stats.add(duplicate_rate=duplicate_count / max(1, len(completions)), duplicate_token_reward_mean=float(np.mean(rewards)) if rewards else 0.0)
-        return rewards
-
-    return duplicate_token_reward
+    return history_exclusion_reward
 
 
 def build_reranker_reward(
@@ -264,20 +295,22 @@ def build_reranker_reward(
 ):
     reranker = RerankerScores(args.reranker_score_path) if args.reranker_score_path is not None and args.reranker_reward_weight != 0.0 else None
 
-    def reranker_reward(completions: list[Any], user_id: list[Any] | None = None, **_: Any) -> list[float]:
+    def reranker_reward(completions: list[Any], user_id: list[Any] | None = None, top_k: list[int] | None = None, **_: Any) -> list[float]:
         if reranker is None or user_id is None:
             return [0.0] * len(completions)
         rewards = []
         matched = 0
-        for completion, uid in zip(completions, user_id):
-            token = first_valid_movie_token(completion, valid_movie_tokens)
-            movie_id = token_to_movie_id.get(token) if token is not None else None
-            if movie_id is None:
+        list_lengths = []
+        for index, (completion, uid) in enumerate(zip(completions, user_id)):
+            expected_k = int(top_k[index]) if top_k is not None else 10
+            movie_ids = [token_to_movie_id[token] for token in unique_valid_movie_tokens(completion, valid_movie_tokens)[:expected_k] if token in token_to_movie_id]
+            list_lengths.append(len(movie_ids))
+            if not movie_ids:
                 rewards.append(0.0)
                 continue
             matched += 1
-            rewards.append(args.reranker_reward_weight * reranker.percentile(uid, movie_id))
-        stats.add(reranker_match_rate=matched / max(1, len(completions)), reranker_reward_mean=float(np.mean(rewards)) if rewards else 0.0)
+            rewards.append(args.reranker_reward_weight * float(np.mean([reranker.percentile(uid, movie_id) for movie_id in movie_ids])))
+        stats.add(reranker_match_rate=matched / max(1, len(completions)), reranker_list_len_mean=float(np.mean(list_lengths)) if list_lengths else 0.0, reranker_reward_mean=float(np.mean(rewards)) if rewards else 0.0)
         return rewards
 
     return reranker_reward
@@ -290,9 +323,12 @@ def build_reward_funcs(
 ) -> list:
     stats = RewardStats(args.reward_log_interval)
     return [
-        build_exact_match_reward(valid_movie_tokens),
-        build_validity_reward(args, valid_movie_tokens, stats),
-        build_duplicate_token_reward(args, valid_movie_tokens, stats),
+        build_list_ndcg_reward(args, valid_movie_tokens, stats),
+        build_exact_first_reward(args, valid_movie_tokens),
+        build_format_reward(args, valid_movie_tokens, stats),
+        build_unique_list_reward(args, valid_movie_tokens, stats),
+        build_list_validity_reward(args, valid_movie_tokens, stats),
+        build_history_exclusion_reward(args, valid_movie_tokens, stats),
         build_reranker_reward(args, token_to_movie_id, valid_movie_tokens, stats),
     ]
 
