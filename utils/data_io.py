@@ -8,13 +8,12 @@ import pandas as pd
 
 
 _MOVIE_ID_PREFIX = "movie_"
+_USER_ID_PREFIX = "user_"
 MOVIE_ID_FEATURE_COLUMNS = frozenset({"movie_id", "title"})
 _TEXT_FEATURE_COLUMNS = frozenset({"movie_id", "title", "genres", "description"})
 
 _MOVIE_FEATURE_COLUMNS_BY_TASK = {
     "NextMoviePrediction": MOVIE_ID_FEATURE_COLUMNS,
-    "Seq_ID2Feature": _TEXT_FEATURE_COLUMNS,
-    "Seq_Feature2ID": _TEXT_FEATURE_COLUMNS,
     "ID2Feature": _TEXT_FEATURE_COLUMNS,
     "Feature2ID": _TEXT_FEATURE_COLUMNS,
 }
@@ -43,6 +42,10 @@ def movie_id_sort_key(movie_id: Any) -> tuple[int, int | str]:
 
 def movie_token(movie_id: Any) -> str:
     return f"{_MOVIE_ID_PREFIX}{clean_value(movie_id)}"
+
+
+def user_token(user_id: Any) -> str:
+    return f"{_USER_ID_PREFIX}{clean_value(user_id)}"
 
 
 def required_movie_feature_columns(tasks: Iterable[str]) -> set[str]:

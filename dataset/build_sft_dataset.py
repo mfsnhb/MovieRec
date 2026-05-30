@@ -30,8 +30,8 @@ from utils.data_io import (
     load_ratings,
     load_user_profiles,
     required_movie_feature_columns,
+    user_token,
 )
-from utils.reranker_scores import RerankerScores
 
 SOURCE = "funrec-movielens-1m"
 LEAVE_ONE_OUT_SPLITS = (
@@ -39,7 +39,6 @@ LEAVE_ONE_OUT_SPLITS = (
     ("valid", 2),
     ("test", 1),
 )
-TRAIN_TARGET_OFFSET = 3
 
 
 @dataclass(frozen=True)
@@ -64,18 +63,15 @@ class JsonlWriters:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build MovieLens SFT JSONL data with Movie ID tokens.")
+    parser = argparse.ArgumentParser(description="Build MovieLens SFT JSONL data with single Movie ID token targets.")
     parser.add_argument("--raw-dir", type=Path, default=Path("data/raw/funrec-movielens-1m"))
     parser.add_argument("--out-dir", type=Path, default=Path("data/processed/sft_movielens_1m"))
     parser.add_argument("--stage", choices=["all", "alignment", "recommendation"], default="all")
     parser.add_argument("--tasks", default="all")
     parser.add_argument("--min-history", type=int, default=3)
     parser.add_argument("--max-history", type=int, default=50)
-    parser.add_argument("--train-windows-per-user", type=int, default=5)
-    parser.add_argument("--reranker-score-path", type=Path)
-    parser.add_argument("--prefix-label-path", type=Path)
-    parser.add_argument("--sft-topk-min", type=int, default=5)
-    parser.add_argument("--sft-topk-max", type=int, default=10)
+    parser.add_argument("--max-train-examples", type=int, default=100_000)
+    parser.add_argument("--train-sample-seed", type=int, default=42)
     parser.add_argument("--max-users", type=int)
     parser.add_argument("--max-examples-per-task", type=int)
     parser.add_argument("--sample-per-task", type=int, default=3)
@@ -119,9 +115,6 @@ def record_from_rendered(
     history: list[dict[str, Any]] | None = None,
     target_position: int | None = None,
     train_window_index: int | None = None,
-    candidate_movie_ids: list[str] | None = None,
-    label_movie_ids: list[str] | None = None,
-    label_scores: list[float] | None = None,
 ) -> dict[str, Any]:
     record = {
         "id": example_id,
@@ -133,7 +126,8 @@ def record_from_rendered(
         "source": SOURCE,
     }
     if user_id is not None:
-        record["user_id"] = user_id
+        record["user_id"] = clean_value(user_id)
+        record["user_token"] = user_token(user_id)
     if target_movie_id is not None:
         record["target_movie_id"] = clean_value(target_movie_id)
         record["target_movie_token"] = movie_features.token(target_movie_id)
@@ -146,22 +140,6 @@ def record_from_rendered(
         record["history_movie_ids"] = [clean_value(event["movie_id"]) for event in history]
         record["history_movie_tokens"] = [movie_features.token(event["movie_id"]) for event in history]
         record["history_movie_titles"] = [movie_features.title(event["movie_id"]) for event in history]
-    if candidate_movie_ids is not None:
-        normalized_candidates = [clean_value(movie_id) for movie_id in candidate_movie_ids]
-        record["candidate_movie_ids"] = normalized_candidates
-        record["candidate_movie_tokens"] = [movie_features.token(movie_id) for movie_id in normalized_candidates]
-        record["candidate_movie_titles"] = [movie_features.title(movie_id) for movie_id in normalized_candidates]
-        if target_movie_id is not None:
-            record["positive_candidate_index"] = normalized_candidates.index(clean_value(target_movie_id))
-    if label_movie_ids is not None:
-        normalized_labels = [clean_value(movie_id) for movie_id in label_movie_ids]
-        record["label_movie_ids"] = normalized_labels
-        record["label_movie_tokens"] = [movie_features.token(movie_id) for movie_id in normalized_labels]
-        record["label_movie_titles"] = [movie_features.title(movie_id) for movie_id in normalized_labels]
-        record["label_k"] = len(normalized_labels)
-        record["label_source"] = "sasrec_prefix_teacher" if label_scores is not None else "sasrec_reranker_scores"
-        if label_scores is not None:
-            record["label_scores"] = label_scores
     return record
 
 
@@ -178,6 +156,7 @@ def eval_record_from_target(
         "id": f"eval:user_{user_id}:loo_{split}:pos_{target_position}",
         "split": split,
         "user_id": clean_value(user_id),
+        "user_token": user_token(user_id),
         "target_position": target_position,
         "target_movie_id": clean_value(target_movie_id),
         "target_movie_token": movie_features.token(target_movie_id),
@@ -207,38 +186,18 @@ def maybe_write(
     return total_written + 1
 
 
-def output_movie_token(line: str) -> str:
-    content = line.strip().split("|", 1)[0].strip()
-    if ". " in content:
-        content = content.split(". ", 1)[1].strip()
-    return content
-
-
 def validate_record(record: dict[str, Any], valid_movie_tokens: set[str]) -> None:
     if not record["instruction"] or not record["input"] or not record["output"]:
         raise ValueError(f"Empty training field in {record['id']}")
     task = record["task"]
-    if task in ID_OUTPUT_TASKS:
-        output_tokens = [output_movie_token(line) for line in record["output"].splitlines() if line.strip()]
-        if task == "NextMoviePrediction" and "label_k" in record:
-            if len(output_tokens) != record["label_k"]:
-                raise ValueError(f"Expected {record['label_k']} output tokens in {record['id']}: {record['output']}")
-            if len(set(output_tokens)) != len(output_tokens):
-                raise ValueError(f"Duplicate movie token output in {record['id']}: {record['output']}")
-        elif output_tokens:
-            output_tokens = output_tokens[:1]
-        for output_token in output_tokens:
-            if output_token not in valid_movie_tokens:
-                raise ValueError(f"Invalid movie token output in {record['id']}: {record['output']}")
+    if task in ID_OUTPUT_TASKS and record["output"].strip() not in valid_movie_tokens:
+        raise ValueError(f"Invalid movie token output in {record['id']}: {record['output']}")
     if task in FEATURE_OUTPUT_TASKS:
         output = record["output"].lower()
         if "genres" not in output or "story" not in output:
             raise ValueError(f"Natural movie profile missing genre/story context in {record['id']}")
-    if task in USER_PROFILE_TASKS:
-        if "rating:" in record["input"]:
-            raise ValueError(f"Interaction rating should not appear in sequence input in {record['id']}")
-        if "- Gender:" not in record["input"] and "User profile is unavailable." not in record["input"]:
-            raise ValueError(f"User profile missing from sequence input in {record['id']}")
+    if task in USER_PROFILE_TASKS and "user_" not in record["input"]:
+        raise ValueError(f"User token missing from sequence input in {record['id']}")
 
 
 def load_inputs(raw_dir: Path, tasks: set[str] | None = None) -> tuple[MovieFeatureStore, dict[str, dict[str, Any]], pd.DataFrame]:
@@ -301,78 +260,31 @@ def loo_targets(records: list[dict[str, Any]], min_history: int, max_history: in
         yield split, target_pos, history, records[target_pos]
 
 
-def non_overlapping_train_targets(
-    records: list[dict[str, Any]],
+def training_targets(
+    records_by_user: dict[str, list[dict[str, Any]]],
     min_history: int,
     max_history: int | None,
-    windows_per_user: int,
-) -> Iterable[SequenceTarget]:
-    if windows_per_user <= 0:
-        return
-    target_pos = len(records) - TRAIN_TARGET_OFFSET
-    window_size = max_history if max_history is not None and max_history > 0 else target_pos
-    for window_index in range(windows_per_user):
-        if target_pos < min_history:
-            break
-        history_end = target_pos
-        history_start = max(0, history_end - window_size)
-        history = records[history_start:history_end]
-        if len(history) < min_history:
-            break
-        yield SequenceTarget("train", target_pos, history, records[target_pos], window_index)
-        target_pos = history_start - 1
+    max_train_examples: int,
+    seed: int,
+) -> list[tuple[str, SequenceTarget]]:
+    candidates: list[tuple[str, int]] = []
+    for user_id, records in records_by_user.items():
+        last_train_pos = len(records) - 3
+        for target_pos in range(min_history, last_train_pos + 1):
+            candidates.append((user_id, target_pos))
+    rng = random.Random(seed)
+    if len(candidates) > max_train_examples:
+        candidates = rng.sample(candidates, max_train_examples)
+    candidates.sort(key=lambda item: (item[0], item[1]))
 
-
-def sequence_targets(
-    records: list[dict[str, Any]],
-    min_history: int,
-    max_history: int | None,
-    train_windows_per_user: int,
-) -> Iterable[SequenceTarget]:
-    yield from non_overlapping_train_targets(records, min_history, max_history, train_windows_per_user)
-    for split, target_pos, history, target in loo_targets(records, min_history, max_history):
-        if split == "train":
-            continue
-        yield SequenceTarget(split, target_pos, history, target)
-
-
-def load_prefix_labels(path: Path | None) -> dict[str, tuple[list[str], list[float]]]:
-    if path is None:
-        return {}
-    labels: dict[str, tuple[list[str], list[float]]] = {}
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            record = json.loads(line)
-            labels[str(record["id"])] = (
-                [clean_value(movie_id) for movie_id in record["label_movie_ids"]],
-                [float(score) for score in record.get("label_scores", [])],
-            )
-    return labels
-
-
-def teacher_augmented_label(target_movie_id: str, teacher_movie_ids: list[str], teacher_scores: list[float], k: int) -> tuple[list[str], list[float]]:
-    target_movie_id = clean_value(target_movie_id)
-    label_movie_ids = [target_movie_id]
-    label_scores = [float("inf")]
-    for movie_id, score in zip(teacher_movie_ids, teacher_scores, strict=False):
-        movie_id = clean_value(movie_id)
-        if movie_id == target_movie_id or movie_id in label_movie_ids:
-            continue
-        label_movie_ids.append(movie_id)
-        label_scores.append(float(score))
-        if len(label_movie_ids) >= k:
-            break
-    return label_movie_ids, label_scores
-
-
-def topk_label_from_reranker(
-    reranker_scores: RerankerScores | None,
-    user_id: str,
-    history: list[dict[str, Any]],
-    k: int,
-) -> tuple[list[str], list[float]]:
-    excluded = [clean_value(event["movie_id"]) for event in history]
-    return reranker_scores.top_movie_ids_with_scores(user_id, excluded, k)
+    targets = []
+    for index, (user_id, target_pos) in enumerate(candidates):
+        records = records_by_user[user_id]
+        history = records[:target_pos]
+        if max_history is not None and max_history > 0:
+            history = history[-max_history:]
+        targets.append((user_id, SequenceTarget("train", target_pos, history, records[target_pos], index)))
+    return targets
 
 
 def emit_sequence_tasks(
@@ -390,95 +302,79 @@ def emit_sequence_tasks(
     total_written: int,
 ) -> int:
     grouped = ratings_df.groupby("user_id", sort=False)
-    rng = random.Random(args.prompt_template_seed)
-    reranker_scores = RerankerScores(args.reranker_score_path) if args.reranker_score_path is not None else None
-    prefix_labels = load_prefix_labels(args.prefix_label_path)
-    if "NextMoviePrediction" in tasks and reranker_scores is None and not prefix_labels:
-        raise ValueError("--prefix-label-path or --reranker-score-path is required for NextMoviePrediction top-k SFT labels.")
-    if args.sft_topk_min < 1 or args.sft_topk_max < args.sft_topk_min:
-        raise ValueError("Require 1 <= --sft-topk-min <= --sft-topk-max.")
-
-    processed_users = 0
+    records_by_user: dict[str, list[dict[str, Any]]] = {}
     for user_id, user_ratings in grouped:
-        if args.max_users is not None and processed_users >= args.max_users:
+        if args.max_users is not None and len(records_by_user) >= args.max_users:
             break
-        processed_users += 1
         records = user_ratings.to_dict("records")
-        if len(records) <= args.min_history:
+        if len(records) > args.min_history:
+            records_by_user[clean_value(user_id)] = records
+
+    for user_id, sequence_target in training_targets(
+        records_by_user,
+        args.min_history,
+        args.max_history,
+        args.max_train_examples,
+        args.train_sample_seed,
+    ):
+        if "NextMoviePrediction" not in tasks:
             continue
-        for sequence_target in sequence_targets(records, args.min_history, args.max_history, args.train_windows_per_user):
-            target_movie_id = sequence_target.target["movie_id"]
-            if sequence_target.split != "train":
-                eval_record = eval_record_from_target(
-                    split=sequence_target.split,
-                    movie_features=movie_features,
-                    user_id=user_id,
-                    target_movie_id=target_movie_id,
-                    history=sequence_target.history,
-                    target_position=sequence_target.target_pos,
-                )
-                writers.write(sequence_target.split, eval_record)
-                eval_counts[sequence_target.split] += 1
-                if len(eval_samples[sequence_target.split]) < args.sample_per_task:
-                    eval_samples[sequence_target.split].append(eval_record)
-                continue
+        target_movie_id = sequence_target.target["movie_id"]
+        rendered = build_next_movie_prediction(
+            user_id,
+            sequence_target.history,
+            target_movie_id,
+            movie_features,
+            random.Random(args.prompt_template_seed + (sequence_target.train_window_index or 0)),
+        )
+        record = record_from_rendered(
+            example_id=f"NextMoviePrediction:user_{user_id}:train_{sequence_target.train_window_index}:pos_{sequence_target.target_pos}",
+            task="NextMoviePrediction",
+            split="train",
+            rendered=rendered,
+            movie_features=movie_features,
+            user_id=user_id,
+            target_movie_id=target_movie_id,
+            history=sequence_target.history,
+            target_position=sequence_target.target_pos,
+            train_window_index=sequence_target.train_window_index,
+        )
+        validate_record(record, valid_movie_tokens)
+        total_written = maybe_write(
+            record,
+            writers,
+            counts,
+            samples,
+            args.sample_per_task,
+            total_written,
+            args.max_examples_per_task,
+        )
 
-            if "NextMoviePrediction" not in tasks:
+    for user_id, records in records_by_user.items():
+        for split, target_pos, history, target in loo_targets(records, args.min_history, args.max_history):
+            if split == "train":
                 continue
-
-            label_k = rng.randint(args.sft_topk_min, args.sft_topk_max)
-            example_id = f"NextMoviePrediction:user_{user_id}:train_window_{sequence_target.train_window_index}:pos_{sequence_target.target_pos}"
-            if prefix_labels:
-                all_label_movie_ids, all_label_scores = prefix_labels[example_id]
-            else:
-                all_label_movie_ids, all_label_scores = topk_label_from_reranker(
-                    reranker_scores,
-                    user_id,
-                    sequence_target.history,
-                    label_k,
-                )
-            label_movie_ids, label_scores = teacher_augmented_label(
-                target_movie_id,
-                all_label_movie_ids,
-                all_label_scores,
-                label_k,
-            )
-            rendered = build_next_movie_prediction(
-                users.get(user_id),
-                sequence_target.history,
-                label_movie_ids,
-                movie_features,
-                rng,
-            )
-            record = record_from_rendered(
-                example_id=example_id,
-                task="NextMoviePrediction",
-                split="train",
-                rendered=rendered,
+            eval_record = eval_record_from_target(
+                split=split,
                 movie_features=movie_features,
                 user_id=user_id,
-                target_movie_id=target_movie_id,
-                history=sequence_target.history,
-                target_position=sequence_target.target_pos,
-                train_window_index=sequence_target.train_window_index,
-                label_movie_ids=label_movie_ids,
-                label_scores=label_scores,
+                target_movie_id=target["movie_id"],
+                history=history,
+                target_position=target_pos,
             )
-            validate_record(record, valid_movie_tokens)
-            total_written = maybe_write(
-                record,
-                writers,
-                counts,
-                samples,
-                args.sample_per_task,
-                total_written,
-                args.max_examples_per_task,
-            )
+            writers.write(split, eval_record)
+            eval_counts[split] += 1
+            if len(eval_samples[split]) < args.sample_per_task:
+                eval_samples[split].append(eval_record)
     return total_written
 
 
 def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def user_token_records(user_ids: Iterable[Any]) -> list[dict[str, str]]:
+    return [{"user_id": clean_value(user_id), "user_token": user_token(user_id)} for user_id in user_ids]
 
 
 def main() -> None:
@@ -546,6 +442,7 @@ def main() -> None:
         },
     )
     write_json(args.out_dir / "movie_tokens.json", movie_features.token_records())
+    write_json(args.out_dir / "user_tokens.json", user_token_records(user_ids))
     write_json(
         args.out_dir / "manifest.json",
         {
@@ -557,30 +454,13 @@ def main() -> None:
             "max_history": args.max_history,
             "sequence_split_protocol": "leave_one_out",
             "leave_one_out_splits": {split: f"target is the {offset} item from the end" for split, offset in LEAVE_ONE_OUT_SPLITS},
-            "split_protocol_note": (
-                "Leave-one-out is applied at the user sequence level. Training JSONL contains SFT task records built from "
-                "non-overlapping train windows; valid/test JSONL contain raw sequence-target eval records without task, "
-                "instruction, input, or output fields."
-            ),
-            "train_windows_per_user": args.train_windows_per_user,
-            "sft_train_sampling_protocol": "non_overlapping_recent_windows",
-            "sft_train_window_rule": (
-                "For SFT recommendation training, NextMoviePrediction uses the configured non-overlapping train windows. "
-                "Each train label places the true clicked target first, then fills the remaining ranked slots with SASRec "
-                "prefix-teacher recommendations after excluding the prompt history and duplicates. "
-                "Each earlier train target is the item immediately before the previous max-history window, "
-                "so train history windows do not overlap."
-            ),
-            "recommendation_label_source": (
-                "sasrec_prefix_teacher" if args.prefix_label_path is not None else "sasrec_reranker_scores" if args.reranker_score_path is not None else None
-            ),
-            "prefix_label_path": str(args.prefix_label_path) if args.prefix_label_path is not None else None,
-            "reranker_score_path": str(args.reranker_score_path) if args.reranker_score_path is not None else None,
-            "recommendation_label_k_range": [args.sft_topk_min, args.sft_topk_max],
-            "recommendation_output_format": "one_movie_token_per_line_ranked",
+            "sft_train_sampling_protocol": "overlapping_prefix_sample",
+            "max_train_examples": args.max_train_examples,
+            "train_sample_seed": args.train_sample_seed,
+            "recommendation_output_format": "single_movie_token",
             "max_examples_per_task": args.max_examples_per_task,
             "prompt_template_seed": args.prompt_template_seed,
-            "target_unit": "movie_id_token_list",
+            "target_unit": "movie_id_token",
             "counts": {
                 "train": total_written,
                 "valid": eval_counts["valid"],

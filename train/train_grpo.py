@@ -2,67 +2,57 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
-import re
+import shutil
 from pathlib import Path
 from typing import Any
 
-import numpy as np
+import torch
+import torch.nn.functional as F
 from datasets import load_dataset
-from peft import LoraConfig, PeftModel, prepare_model_for_kbit_training
-from transformers import TrainerCallback
+from peft import PeftModel
+from torch.utils.data import DataLoader
+from transformers import get_cosine_schedule_with_warmup
 
 from model.llm import ModelConfig, load_causal_lm, load_tokenizer
 from utils.data_io import load_movie_feature_store, required_movie_feature_columns
 from utils.reranker_scores import RerankerScores
-from utils.training_utils import Logger, ensure_dir, print_trainable_parameters, save_json, save_last_checkpoint_as_final, setup_seed
-
-
-MOVIE_TOKEN_RE = re.compile(r"\bmovie_\d+\b")
-NUMBERED_MOVIE_LINE_RE = re.compile(r"^\s*\d+\.\s*(movie_\d+)\s*\|\s*\S+", re.MULTILINE)
+from utils.training_utils import Logger, ensure_dir, print_trainable_parameters, remove_path, save_json, setup_seed
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="QLoRA GRPO for MovieRec movie ID token recommendation.")
-    parser.add_argument("--model-name-or-path", type=str, default="models/sft/qwen3_4b_QLoRA/final")
+    parser = argparse.ArgumentParser(description="GRPO for MovieRec movie-token ranking.")
+    parser.add_argument("--model-name-or-path", type=str, default="models/sft/Qwen3-4B-SFT-QLoRA/final")
     parser.add_argument("--data-dir", type=Path, default=Path("data/processed/grpo_movielens_1m"))
-    parser.add_argument("--output-dir", type=Path, default=Path("models/grpo/qwen3_4b_QLoRA"))
-    parser.add_argument("--logging-dir", type=Path, default=Path("outputs/grpo/qwen3_4b_QLoRA"))
-    parser.add_argument("--max-completion-length", type=int, default=32)
-    parser.add_argument("--num-generations", type=int, default=4)
+    parser.add_argument("--output-dir", type=Path, default=Path("models/grpo/Qwen3_4B-GRPO"))
+    parser.add_argument("--logging-dir", type=Path, default=Path("outputs/grpo/Qwen3-4B-GRPO"))
+    parser.add_argument("--max-seq-length", type=int, default=384)
+    parser.add_argument("--num-generations", type=int, default=8)
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--mask-history-actions", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--max-steps", type=int, default=-1)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--accumulation-steps", type=int, default=8)
-    parser.add_argument("--learning-rate", type=float, default=5e-6)
-    parser.add_argument("--min-learning-rate", type=float, default=5e-7)
+    parser.add_argument("--learning-rate", type=float, default=1e-6)
+    parser.add_argument("--min-learning-rate", type=float, default=1e-7)
     parser.add_argument("--epochs", type=float, default=1.0)
     parser.add_argument("--warmup-ratio", type=float, default=0.03)
     parser.add_argument("--beta", type=float, default=0.04)
     parser.add_argument("--log-interval", type=int, default=1)
-    parser.add_argument("--save-interval", type=int, default=1000)
+    parser.add_argument("--save-interval", type=int, default=500)
     parser.add_argument("--logging-first-step", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--reward-log-interval", type=int, default=10)
-    parser.add_argument("--log-completions", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--num-completions-to-print", type=int, default=4)
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--lora-r", type=int, default=16)
-    parser.add_argument("--lora-alpha", type=int, default=32)
-    parser.add_argument("--lora-dropout", type=float, default=0.05)
-    parser.add_argument("--target-modules", default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
     parser.add_argument("--load-in-4bit", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--attn-implementation", choices=["eager", "sdpa", "flash_attention_2"])
     parser.add_argument("--raw-dir", type=Path, default=Path("data/raw/funrec-movielens-1m"))
     parser.add_argument("--reranker-score-path", type=Path)
-    parser.add_argument("--reranker-reward-weight", type=float, default=0.1)
-    parser.add_argument("--ndcg-reward-weight", type=float, default=1.0)
-    parser.add_argument("--exact-first-reward-weight", type=float, default=0.2)
-    parser.add_argument("--format-reward-weight", type=float, default=0.2)
-    parser.add_argument("--unique-list-reward-weight", type=float, default=0.2)
-    parser.add_argument("--valid-list-reward-weight", type=float, default=0.1)
-    parser.add_argument("--invalid-token-penalty", type=float, default=-0.5)
+    parser.add_argument("--reranker-reward-weight", type=float, default=0.05)
+    parser.add_argument("--exact-match-reward-weight", type=float, default=1.0)
+    parser.add_argument("--ndcg-reward-weight", type=float, default=0.5)
     parser.add_argument("--history-token-penalty", type=float, default=-0.3)
-    parser.add_argument("--resume-from-checkpoint", type=str)
+    parser.add_argument("--duplicate-token-penalty", type=float, default=-0.2)
     parser.add_argument("--use-wandb", action="store_true")
     parser.add_argument("--wandb-project", default="MovieRec")
     return parser.parse_args()
@@ -75,268 +65,270 @@ def load_grpo_train_dataset(data_dir: Path):
     return load_dataset("json", data_files=str(train_path), split="train")
 
 
-def build_grpo_config(args: argparse.Namespace) -> GRPOConfig:
-    from trl import GRPOConfig
-
-    return GRPOConfig(
-        output_dir=str(args.output_dir),
-        logging_dir=str(args.logging_dir),
-        learning_rate=args.learning_rate,
-        lr_scheduler_type="cosine_with_min_lr",
-        lr_scheduler_kwargs={"min_lr": args.min_learning_rate},
-        num_train_epochs=args.epochs,
-        warmup_ratio=args.warmup_ratio,
-        per_device_train_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.accumulation_steps,
-        logging_steps=args.log_interval,
-        logging_first_step=args.logging_first_step,
-        save_steps=args.save_interval,
-        save_strategy="steps",
-        save_total_limit=2,
-        max_completion_length=args.max_completion_length,
-        num_generations=args.num_generations,
-        beta=args.beta,
-        bf16=args.bf16,
-        gradient_checkpointing=args.gradient_checkpointing,
-        log_completions=args.log_completions,
-        num_completions_to_print=args.num_completions_to_print,
-        report_to="wandb" if args.use_wandb else "none",
-        run_name=args.output_dir.name,
-    )
-
-
-def split_csv(value: str | None) -> list[str]:
-    if not value:
-        return []
-    return [name.strip() for name in value.split(",") if name.strip()]
-
-
-def build_lora_config(args: argparse.Namespace, movie_token_ids: list[int]) -> LoraConfig:
-    kwargs = {
-        "r": args.lora_r,
-        "lora_alpha": args.lora_alpha,
-        "lora_dropout": args.lora_dropout,
-        "bias": "none",
-        "task_type": "CAUSAL_LM",
-        "target_modules": split_csv(args.target_modules),
-    }
-    fields = set(getattr(LoraConfig, "__dataclass_fields__", {}))
-    if movie_token_ids:
-        if "trainable_token_indices" not in fields:
-            raise RuntimeError(
-                "The installed PEFT version does not support trainable_token_indices. "
-                "Use the remote PEFT version used for the experiments, or upgrade PEFT."
-            )
-        kwargs["trainable_token_indices"] = movie_token_ids
-    return LoraConfig(**kwargs)
-
-
-def extract_completion_text(completion: Any) -> str:
-    if isinstance(completion, str):
-        return completion
-    if isinstance(completion, list) and completion and isinstance(completion[0], dict):
-        return completion[0].get("content", "")
-    return str(completion)
-
-
-def extract_valid_movie_tokens(completion: Any, valid_movie_tokens: set[str]) -> list[str]:
-    tokens: list[str] = []
-    for match in MOVIE_TOKEN_RE.finditer(extract_completion_text(completion)):
-        token = match.group(0)
-        if token in valid_movie_tokens:
-            tokens.append(token)
-    return tokens
-
-
-def unique_valid_movie_tokens(completion: Any, valid_movie_tokens: set[str]) -> list[str]:
-    seen: set[str] = set()
-    tokens: list[str] = []
-    for token in extract_valid_movie_tokens(completion, valid_movie_tokens):
-        if token not in seen:
-            seen.add(token)
-            tokens.append(token)
-    return tokens
-
-
-def first_valid_movie_token(completion: Any, valid_movie_tokens: set[str]) -> str | None:
-    tokens = unique_valid_movie_tokens(completion, valid_movie_tokens)
-    return tokens[0] if tokens else None
-
-
-class RewardStats:
-    def __init__(self, log_interval: int) -> None:
-        self.log_interval = max(1, log_interval)
-        self.calls = 0
-        self.totals: dict[str, float] = {}
-
-    def add(self, **values: float) -> None:
-        self.calls += 1
-        for key, value in values.items():
-            self.totals[key] = self.totals.get(key, 0.0) + float(value)
-        if self.calls % self.log_interval == 0:
-            summary = {key: value / self.calls for key, value in sorted(self.totals.items())}
-            print("REWARD_STATS", json.dumps(summary, ensure_ascii=False), flush=True)
-
-
-def build_movie_token_maps(raw_dir: Path) -> tuple[dict[str, str], set[str], list[str]]:
+def build_movie_maps(raw_dir: Path) -> tuple[list[str], list[str], dict[str, int]]:
     movie_features = load_movie_feature_store(raw_dir, required_movie_feature_columns({"NextMoviePrediction"}))
-    token_to_movie_id = movie_features.movie_token_to_id
     movie_tokens = list(movie_features.movie_tokens)
-    return token_to_movie_id, set(movie_tokens), movie_tokens
+    movie_ids = list(movie_features.movie_ids)
+    return movie_tokens, movie_ids, {movie_id: index for index, movie_id in enumerate(movie_ids)}
 
 
-def build_list_ndcg_reward(args: argparse.Namespace, valid_movie_tokens: set[str], stats: RewardStats):
-    def ndcg_reward(completions: list[Any], target_movie_token: list[str], **_: Any) -> list[float]:
-        rewards = []
-        hits = 0
-        ranks = []
-        for completion, target in zip(completions, target_movie_token):
-            tokens = unique_valid_movie_tokens(completion, valid_movie_tokens)
-            rank = tokens.index(target) + 1 if target in tokens else None
-            if rank is None:
-                rewards.append(0.0)
-                continue
-            hits += 1
-            ranks.append(rank)
-            rewards.append(args.ndcg_reward_weight / np.log2(rank + 1))
-        stats.add(ndcg_hit_rate=hits / max(1, len(completions)), ndcg_rank_mean=float(np.mean(ranks)) if ranks else 0.0, ndcg_reward_mean=float(np.mean(rewards)) if rewards else 0.0)
-        return rewards
+class ItemGrpoCollator:
+    def __init__(self, tokenizer, movie_id_to_index: dict[str, int], max_length: int) -> None:
+        self.tokenizer = tokenizer
+        self.movie_id_to_index = movie_id_to_index
+        self.max_length = max_length
 
-    return ndcg_reward
-
-
-def build_exact_first_reward(args: argparse.Namespace, valid_movie_tokens: set[str]):
-    def exact_first_reward(completions: list[Any], target_movie_token: list[str], **_: Any) -> list[float]:
-        rewards = []
-        for completion, target in zip(completions, target_movie_token):
-            rewards.append(args.exact_first_reward_weight if first_valid_movie_token(completion, valid_movie_tokens) == target else 0.0)
-        return rewards
-
-    return exact_first_reward
+    def __call__(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
+        encoded = self.tokenizer(
+            [example["prompt"] for example in examples],
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+        )
+        encoded["target_movie_index"] = torch.tensor(
+            [self.movie_id_to_index[str(example["target_movie_id"])] for example in examples],
+            dtype=torch.long,
+        )
+        encoded["history_movie_indices"] = [
+            [self.movie_id_to_index[str(movie_id)] for movie_id in example.get("history_movie_ids", [])]
+            for example in examples
+        ]
+        encoded["user_id"] = [str(example["user_id"]) for example in examples]
+        return encoded
 
 
-def build_format_reward(args: argparse.Namespace, valid_movie_tokens: set[str], stats: RewardStats):
-    def format_reward(completions: list[Any], top_k: list[int] | None = None, **_: Any) -> list[float]:
-        rewards = []
-        format_rates = []
-        for index, completion in enumerate(completions):
-            expected_k = int(top_k[index]) if top_k is not None else 10
-            text = extract_completion_text(completion)
-            lines = [line for line in text.splitlines() if line.strip()]
-            numbered = NUMBERED_MOVIE_LINE_RE.findall(text)
-            valid_numbered = [token for token in numbered if token in valid_movie_tokens]
-            rate = min(1.0, len(valid_numbered) / max(1, expected_k))
-            if lines and len(lines) > expected_k + 2:
-                rate *= 0.8
-            format_rates.append(rate)
-            rewards.append(args.format_reward_weight * rate)
-        stats.add(format_rate=float(np.mean(format_rates)) if format_rates else 0.0, format_reward_mean=float(np.mean(rewards)) if rewards else 0.0)
-        return rewards
-
-    return format_reward
+def last_non_padding_indices(attention_mask: torch.Tensor) -> torch.Tensor:
+    reversed_mask = attention_mask.flip(dims=[1])
+    distance_from_end = reversed_mask.long().argmax(dim=1)
+    return attention_mask.shape[1] - 1 - distance_from_end
 
 
-def build_unique_list_reward(args: argparse.Namespace, valid_movie_tokens: set[str], stats: RewardStats):
-    def unique_list_reward(completions: list[Any], top_k: list[int] | None = None, **_: Any) -> list[float]:
-        rewards = []
-        unique_rates = []
-        for index, completion in enumerate(completions):
-            expected_k = int(top_k[index]) if top_k is not None else 10
-            tokens = extract_valid_movie_tokens(completion, valid_movie_tokens)
-            unique_count = len(dict.fromkeys(tokens[:expected_k]))
-            rate = unique_count / max(1, expected_k)
-            unique_rates.append(rate)
-            rewards.append(args.unique_list_reward_weight * rate)
-        stats.add(unique_rate=float(np.mean(unique_rates)) if unique_rates else 0.0, unique_list_reward_mean=float(np.mean(rewards)) if rewards else 0.0)
-        return rewards
-
-    return unique_list_reward
+def final_movie_logits(model, input_ids: torch.Tensor, attention_mask: torch.Tensor, movie_token_ids: torch.Tensor) -> torch.Tensor:
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+    rows = torch.arange(input_ids.shape[0], device=input_ids.device)
+    last_positions = last_non_padding_indices(attention_mask).to(input_ids.device)
+    return outputs.logits[rows, last_positions, :].index_select(dim=-1, index=movie_token_ids)
 
 
-def build_list_validity_reward(args: argparse.Namespace, valid_movie_tokens: set[str], stats: RewardStats):
-    def list_validity_reward(completions: list[Any], top_k: list[int] | None = None, **_: Any) -> list[float]:
-        rewards = []
-        valid_rates = []
-        for index, completion in enumerate(completions):
-            expected_k = int(top_k[index]) if top_k is not None else 10
-            raw_tokens = MOVIE_TOKEN_RE.findall(extract_completion_text(completion))
-            valid_count = sum(token in valid_movie_tokens for token in raw_tokens[:expected_k])
-            rate = valid_count / max(1, min(expected_k, len(raw_tokens))) if raw_tokens else 0.0
-            valid_rates.append(rate)
-            rewards.append(args.valid_list_reward_weight * rate if raw_tokens else args.invalid_token_penalty)
-        stats.add(list_valid_rate=float(np.mean(valid_rates)) if valid_rates else 0.0, list_validity_reward_mean=float(np.mean(rewards)) if rewards else 0.0)
-        return rewards
-
-    return list_validity_reward
+def mask_history_logits(movie_logits: torch.Tensor, history_indices: list[list[int]]) -> torch.Tensor:
+    masked = movie_logits.clone()
+    for row, history in enumerate(history_indices):
+        if history:
+            masked[row, torch.tensor(history, device=movie_logits.device, dtype=torch.long)] = -torch.inf
+    return masked
 
 
-def build_history_exclusion_reward(args: argparse.Namespace, valid_movie_tokens: set[str], stats: RewardStats):
-    def history_exclusion_reward(completions: list[Any], history_movie_tokens: list[list[str]], **_: Any) -> list[float]:
-        rewards = []
-        repeat_rates = []
-        for completion, history_tokens in zip(completions, history_movie_tokens):
-            tokens = unique_valid_movie_tokens(completion, valid_movie_tokens)
-            history = set(history_tokens)
-            repeat_count = sum(token in history for token in tokens)
-            repeat_rate = repeat_count / max(1, len(tokens)) if tokens else 0.0
-            repeat_rates.append(repeat_rate)
-            rewards.append(args.history_token_penalty * repeat_count)
-        stats.add(history_repeat_rate=float(np.mean(repeat_rates)) if repeat_rates else 0.0, history_exclusion_reward_mean=float(np.mean(rewards)) if rewards else 0.0)
-        return rewards
-
-    return history_exclusion_reward
+def sample_movie_indices(movie_logits: torch.Tensor, num_generations: int, temperature: float) -> tuple[torch.Tensor, torch.Tensor]:
+    sample_logits = movie_logits / max(temperature, 1e-6)
+    sample_probs = F.softmax(sample_logits, dim=-1)
+    sampled_indices = torch.multinomial(sample_probs, num_samples=num_generations, replacement=True)
+    log_probs = F.log_softmax(movie_logits, dim=-1)
+    return sampled_indices, log_probs.gather(dim=-1, index=sampled_indices)
 
 
-def build_reranker_reward(
+def compute_rewards(
+    *,
     args: argparse.Namespace,
-    token_to_movie_id: dict[str, str],
-    valid_movie_tokens: set[str],
-    stats: RewardStats,
-):
+    sampled_indices: torch.Tensor,
+    sampled_log_probs: torch.Tensor,
+    target_indices: torch.Tensor,
+    history_indices: list[list[int]],
+    user_ids: list[str],
+    movie_ids: list[str],
+    reranker: RerankerScores | None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    device = sampled_indices.device
+    batch_size, num_generations = sampled_indices.shape
+    rewards = torch.zeros((batch_size, num_generations), device=device, dtype=torch.float32)
+
+    exact_mask = sampled_indices == target_indices[:, None]
+    exact_rewards = exact_mask.float() * args.exact_match_reward_weight
+    rewards = rewards + exact_rewards
+
+    ranked_indices = sampled_indices.gather(dim=-1, index=torch.argsort(sampled_log_probs.detach(), dim=-1, descending=True))
+    ranked_matches = ranked_indices == target_indices[:, None]
+    has_target = ranked_matches.any(dim=-1)
+    target_rank = ranked_matches.float().argmax(dim=-1) + 1
+    rank_values = torch.zeros(batch_size, device=device, dtype=torch.float32)
+    if has_target.any():
+        rank_values[has_target] = args.ndcg_reward_weight / torch.log2(target_rank[has_target].float() + 1.0)
+    ndcg_rewards = torch.zeros_like(rewards)
+    ndcg_rewards[exact_mask] = rank_values[:, None].expand_as(rewards)[exact_mask]
+    rewards = rewards + ndcg_rewards
+
+    history_mask = torch.zeros_like(rewards, dtype=torch.bool)
+    for row, history in enumerate(history_indices):
+        if history:
+            history_tensor = torch.tensor(history, device=device, dtype=torch.long)
+            history_mask[row] = (sampled_indices[row, :, None] == history_tensor[None, :]).any(dim=-1)
+    history_rewards = history_mask.float() * args.history_token_penalty
+    rewards = rewards + history_rewards
+
+    duplicate_mask = torch.zeros_like(rewards, dtype=torch.bool)
+    for position in range(num_generations):
+        duplicate_mask[:, position] = (sampled_indices[:, :position] == sampled_indices[:, position : position + 1]).any(dim=-1)
+    duplicate_rewards = duplicate_mask.float() * args.duplicate_token_penalty
+    rewards = rewards + duplicate_rewards
+
+    reranker_rewards = torch.zeros_like(rewards)
+    if reranker is not None and args.reranker_reward_weight != 0.0:
+        values = []
+        for row in range(batch_size):
+            values.append(
+                [
+                    args.reranker_reward_weight * reranker.percentile(user_ids[row], movie_ids[int(movie_index)])
+                    for movie_index in sampled_indices[row].detach().cpu().tolist()
+                ]
+            )
+        reranker_rewards = torch.tensor(values, device=device, dtype=torch.float32)
+        rewards = rewards + reranker_rewards
+
+    reward_std = rewards.std(dim=-1)
+    return rewards, {
+        "exact_rate": float(exact_mask.float().mean().item()),
+        "target_in_group_rate": float(has_target.float().mean().item()),
+        "history_rate": float(history_mask.float().mean().item()),
+        "duplicate_rate": float(duplicate_mask.float().mean().item()),
+        "exact_reward": float(exact_rewards.mean().item()),
+        "ndcg_reward": float(ndcg_rewards.mean().item()),
+        "reranker_reward": float(reranker_rewards.mean().item()),
+        "history_reward": float(history_rewards.mean().item()),
+        "duplicate_reward": float(duplicate_rewards.mean().item()),
+        "reward_mean": float(rewards.mean().item()),
+        "reward_std": float(reward_std.mean().item()),
+    }
+
+
+def group_normalized_advantages(rewards: torch.Tensor) -> torch.Tensor:
+    reward_mean = rewards.mean(dim=-1, keepdim=True)
+    reward_std = rewards.std(dim=-1, keepdim=True)
+    return torch.where(reward_std > 1e-6, (rewards - reward_mean) / reward_std.clamp_min(1e-6), torch.zeros_like(rewards))
+
+
+def save_checkpoint(model, tokenizer, output_dir: Path, step: int, logger: Logger) -> Path:
+    checkpoint_dir = output_dir / f"checkpoint-{step}"
+    remove_path(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(checkpoint_dir)
+    tokenizer.save_pretrained(checkpoint_dir)
+    logger(f"Saved checkpoint to {checkpoint_dir}")
+    return checkpoint_dir
+
+
+def save_final(checkpoint_dir: Path, tokenizer, output_dir: Path, data_dir: Path, logger: Logger) -> Path:
+    final_dir = output_dir / "final"
+    remove_path(final_dir)
+    shutil.move(str(checkpoint_dir), str(final_dir))
+    tokenizer.save_pretrained(final_dir)
+    for filename in ["movie_tokens.json", "user_tokens.json"]:
+        source = data_dir / filename
+        if source.exists():
+            shutil.copyfile(source, final_dir / filename)
+    logger(f"Moved final checkpoint {checkpoint_dir} to {final_dir}")
+    return final_dir
+
+
+def train_item_grpo(args: argparse.Namespace, model, tokenizer, train_dataset, movie_token_ids: list[int], movie_id_to_index: dict[str, int], movie_ids: list[str], logger: Logger) -> None:
+    device = model.device
+    ref_model = load_causal_lm(
+        ModelConfig(args.model_name_or_path, load_in_4bit=args.load_in_4bit, attn_implementation=args.attn_implementation),
+        tokenizer=tokenizer,
+    )
+    ref_model.eval()
+    for parameter in ref_model.parameters():
+        parameter.requires_grad_(False)
+
     reranker = RerankerScores(args.reranker_score_path) if args.reranker_score_path is not None and args.reranker_reward_weight != 0.0 else None
+    movie_token_tensor = torch.tensor(movie_token_ids, device=device, dtype=torch.long)
+    dataloader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=ItemGrpoCollator(tokenizer, movie_id_to_index, args.max_seq_length),
+    )
+    optimizer = torch.optim.AdamW((parameter for parameter in model.parameters() if parameter.requires_grad), lr=args.learning_rate)
+    steps_per_epoch = math.ceil(len(dataloader) / max(1, args.accumulation_steps))
+    total_steps = int(math.ceil(args.epochs * steps_per_epoch))
+    if args.max_steps > 0:
+        total_steps = min(total_steps, args.max_steps)
+    scheduler = get_cosine_schedule_with_warmup(optimizer, int(total_steps * args.warmup_ratio), total_steps)
 
-    def reranker_reward(completions: list[Any], user_id: list[Any] | None = None, top_k: list[int] | None = None, **_: Any) -> list[float]:
-        if reranker is None or user_id is None:
-            return [0.0] * len(completions)
-        rewards = []
-        matched = 0
-        list_lengths = []
-        for index, (completion, uid) in enumerate(zip(completions, user_id)):
-            expected_k = int(top_k[index]) if top_k is not None else 10
-            movie_ids = [token_to_movie_id[token] for token in unique_valid_movie_tokens(completion, valid_movie_tokens)[:expected_k] if token in token_to_movie_id]
-            list_lengths.append(len(movie_ids))
-            if not movie_ids:
-                rewards.append(0.0)
-                continue
-            matched += 1
-            rewards.append(args.reranker_reward_weight * float(np.mean([reranker.percentile(uid, movie_id) for movie_id in movie_ids])))
-        stats.add(reranker_match_rate=matched / max(1, len(completions)), reranker_list_len_mean=float(np.mean(list_lengths)) if list_lengths else 0.0, reranker_reward_mean=float(np.mean(rewards)) if rewards else 0.0)
-        return rewards
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    global_step = 0
+    micro_step = 0
+    totals: dict[str, float] = {}
+    running_calls = 0
+    last_checkpoint: Path | None = None
 
-    return reranker_reward
+    while global_step < total_steps:
+        for batch in dataloader:
+            if global_step >= total_steps:
+                break
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            target_indices = batch["target_movie_index"].to(device)
 
+            movie_logits = final_movie_logits(model, input_ids, attention_mask, movie_token_tensor)
+            if args.mask_history_actions:
+                movie_logits = mask_history_logits(movie_logits, batch["history_movie_indices"])
+            sampled_indices, sampled_log_probs = sample_movie_indices(movie_logits, args.num_generations, args.temperature)
 
-def build_reward_funcs(
-    args: argparse.Namespace,
-    token_to_movie_id: dict[str, str],
-    valid_movie_tokens: set[str],
-) -> list:
-    stats = RewardStats(args.reward_log_interval)
-    return [
-        build_list_ndcg_reward(args, valid_movie_tokens, stats),
-        build_exact_first_reward(args, valid_movie_tokens),
-        build_format_reward(args, valid_movie_tokens, stats),
-        build_unique_list_reward(args, valid_movie_tokens, stats),
-        build_list_validity_reward(args, valid_movie_tokens, stats),
-        build_history_exclusion_reward(args, valid_movie_tokens, stats),
-        build_reranker_reward(args, token_to_movie_id, valid_movie_tokens, stats),
-    ]
+            with torch.no_grad():
+                ref_movie_logits = final_movie_logits(ref_model, input_ids, attention_mask, movie_token_tensor)
+                if args.mask_history_actions:
+                    ref_movie_logits = mask_history_logits(ref_movie_logits, batch["history_movie_indices"])
+                sampled_ref_log_probs = F.log_softmax(ref_movie_logits, dim=-1).gather(dim=-1, index=sampled_indices)
 
+            rewards, reward_stats = compute_rewards(
+                args=args,
+                sampled_indices=sampled_indices,
+                sampled_log_probs=sampled_log_probs,
+                target_indices=target_indices,
+                history_indices=batch["history_movie_indices"],
+                user_ids=batch["user_id"],
+                movie_ids=movie_ids,
+                reranker=reranker,
+            )
+            advantages = group_normalized_advantages(rewards)
+            policy_loss = -(advantages.detach() * sampled_log_probs).mean()
+            log_ratio = sampled_ref_log_probs - sampled_log_probs
+            kl_loss = (torch.exp(log_ratio) - log_ratio - 1.0).mean()
+            loss = policy_loss + args.beta * kl_loss
+            (loss / max(1, args.accumulation_steps)).backward()
 
-class FlushLogCallback(TrainerCallback):
-    def on_log(self, args, state, control, logs=None, **kwargs):
-        if logs is not None:
-            print("TRAIN_METRICS", json.dumps({"step": state.global_step, **logs}, ensure_ascii=False), flush=True)
+            micro_step += 1
+            running_calls += 1
+            current_stats = {
+                **reward_stats,
+                "advantage_abs_mean": float(advantages.abs().mean().item()),
+                "kl": float(kl_loss.item()),
+                "policy_loss": float(policy_loss.item()),
+                "loss": float(loss.item()),
+            }
+            for key, value in current_stats.items():
+                totals[key] = totals.get(key, 0.0) + value
+
+            if micro_step % args.accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+                if global_step % args.log_interval == 0 or (args.logging_first_step and global_step == 1):
+                    summary = {key: value / max(1, running_calls) for key, value in sorted(totals.items())}
+                    summary["step"] = global_step
+                    summary["learning_rate"] = scheduler.get_last_lr()[0]
+                    print("TRAIN_METRICS", json.dumps(summary, ensure_ascii=False), flush=True)
+                    totals.clear()
+                    running_calls = 0
+                if global_step % args.save_interval == 0:
+                    last_checkpoint = save_checkpoint(model, tokenizer, args.output_dir, global_step, logger)
+
+    if last_checkpoint is None or last_checkpoint.name != f"checkpoint-{global_step}":
+        last_checkpoint = save_checkpoint(model, tokenizer, args.output_dir, global_step, logger)
+    save_final(last_checkpoint, tokenizer, args.output_dir, args.data_dir, logger)
 
 
 def main() -> None:
@@ -355,13 +347,16 @@ def main() -> None:
 
     logger("2. Load GRPO train.jsonl and movie token catalog")
     train_dataset = load_grpo_train_dataset(args.data_dir)
-    token_to_movie_id, valid_movie_tokens, movie_tokens = build_movie_token_maps(args.raw_dir)
+    movie_tokens, movie_ids, movie_id_to_index = build_movie_maps(args.raw_dir)
     if args.reranker_score_path is not None and "user_id" not in train_dataset.column_names:
-        raise ValueError("GRPO data must be rebuilt with user_id to use SASRec reranker rewards.")
+        raise ValueError("GRPO data must include user_id to use SASRec reranker rewards.")
 
     logger("3. Load tokenizer and SFT policy model")
     tokenizer = load_tokenizer(args.model_name_or_path, padding_side="left")
     tokenizer.add_tokens(movie_tokens, special_tokens=False)
+    user_tokens_path = Path(args.model_name_or_path) / "user_tokens.json"
+    if user_tokens_path.exists():
+        tokenizer.add_tokens([record["user_token"] for record in json.loads(user_tokens_path.read_text(encoding="utf-8"))], special_tokens=False)
     movie_token_ids = [int(token_id) for token_id in tokenizer.convert_tokens_to_ids(movie_tokens)]
     model = load_causal_lm(
         ModelConfig(
@@ -372,33 +367,12 @@ def main() -> None:
         ),
         tokenizer=tokenizer,
     )
-    is_peft_model = isinstance(model, PeftModel)
-    if args.load_in_4bit and not is_peft_model:
-        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
+    if not isinstance(model, PeftModel):
+        raise ValueError("Item-space GRPO expects a PEFT/adapter SFT checkpoint as --model-name-or-path.")
 
-    logger("4. Build GRPO LoRA and training configuration")
-    peft_config = None if is_peft_model else build_lora_config(args, movie_token_ids)
-    training_args = build_grpo_config(args)
-
-    logger("5. Start GRPO training")
-    from trl import GRPOTrainer
-
-    trainer = GRPOTrainer(
-        model=model,
-        reward_funcs=build_reward_funcs(args, token_to_movie_id, valid_movie_tokens),
-        args=training_args,
-        train_dataset=train_dataset,
-        processing_class=tokenizer,
-        peft_config=peft_config,
-    )
-    trainer.add_callback(FlushLogCallback())
-    print_trainable_parameters(trainer.model, logger)
-    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
-
-    logger("6. Save final GRPO adapter and tokenizer once")
-    final_dir = save_last_checkpoint_as_final(trainer, tokenizer, args.output_dir, logger)
-    save_json(final_dir / "movie_tokens.json", [{"movie_token": token, "movie_id": token_to_movie_id[token]} for token in movie_tokens])
-    logger(f"Final GRPO model is available at {final_dir}")
+    logger("4. Start item-space GRPO training")
+    print_trainable_parameters(model, logger)
+    train_item_grpo(args, model, tokenizer, train_dataset, movie_token_ids, movie_id_to_index, movie_ids, logger)
 
 
 if __name__ == "__main__":

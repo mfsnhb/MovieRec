@@ -9,20 +9,8 @@ from pathlib import Path
 from tqdm import tqdm
 
 from dataset.build_sft_dataset import loo_targets
-from utils.data_io import (
-    clean_value,
-    load_movie_feature_store,
-    load_ratings,
-    load_user_profiles,
-)
-from utils.inference import (
-    RankingConfig,
-    build_recommendation_prompt,
-    generate_movie_recommendations_batch,
-    load_inference_components,
-    prediction_record,
-    rank_movie_recommendations_batch,
-)
+from utils.data_io import clean_value, load_movie_feature_store, load_ratings
+from utils.inference import RankingConfig, build_recommendation_prompt, load_inference_components, prediction_record, rank_movie_recommendations_batch
 from utils.reranker_scores import RerankerScores
 from utils.training_utils import ensure_dir, save_json, setup_seed
 
@@ -37,10 +25,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-history", type=int, default=50)
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--candidate-negatives", type=int, default=0, help="Use candidate eval with this many random negatives per positive; 0 keeps full-ranking eval.")
-    parser.add_argument("--score-mode", choices=["generate", "first_token"], default="generate")
-    parser.add_argument("--generation-max-new-tokens", type=int, default=64)
-    parser.add_argument("--reranker-score-path", type=Path, help="Optional SASRec score npz for reporting distillation agreement metrics.")
+    parser.add_argument("--candidate-negatives", type=int, default=0)
+    parser.add_argument("--reranker-score-path", type=Path)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--load-in-4bit", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--attn-implementation", choices=["eager", "sdpa", "flash_attention_2"])
@@ -59,15 +45,9 @@ def main() -> None:
     ensure_dir(args.output_dir)
 
     movie_features = load_movie_feature_store(args.raw_dir, {"movie_id", "title"})
-    users = load_user_profiles(args.raw_dir)
     ratings_df = load_ratings(args.raw_dir, movie_features)
-    components = load_inference_components(
-        args.model_name_or_path,
-        movie_features,
-        args.load_in_4bit,
-        args.attn_implementation,
-    )
-    ranking_config = RankingConfig(top_k=args.top_k, generation_max_new_tokens=args.generation_max_new_tokens)
+    components = load_inference_components(args.model_name_or_path, movie_features, args.load_in_4bit, args.attn_implementation)
+    ranking_config = RankingConfig(top_k=args.top_k)
 
     predictions_path = args.output_dir / "predictions.jsonl"
     metrics = {
@@ -90,7 +70,7 @@ def main() -> None:
     if args.candidate_negatives > 0:
         for pool_user_id, user_ratings in grouped:
             interacted = {clean_value(movie_id) for movie_id in user_ratings["movie_id"]}
-            negative_pools[pool_user_id] = [movie_id for movie_id in movie_features.movie_ids if movie_id not in interacted]
+            negative_pools[clean_value(pool_user_id)] = [movie_id for movie_id in movie_features.movie_ids if movie_id not in interacted]
 
     with predictions_path.open("w", encoding="utf-8") as handle:
         pending: list[dict[str, object]] = []
@@ -98,21 +78,13 @@ def main() -> None:
         def flush_pending() -> None:
             if not pending:
                 return
-            if args.score_mode == "first_token" or args.candidate_negatives > 0:
-                predictions = rank_movie_recommendations_batch(
-                    components,
-                    [str(item["prompt"]) for item in pending],
-                    ranking_config,
-                    [item["history_movie_ids"] for item in pending],  # type: ignore[list-item]
-                    [item["candidate_movie_ids"] for item in pending],  # type: ignore[list-item]
-                )
-            else:
-                predictions = generate_movie_recommendations_batch(
-                    components,
-                    [str(item["prompt"]) for item in pending],
-                    ranking_config,
-                    [item["history_movie_ids"] for item in pending],  # type: ignore[list-item]
-                )
+            predictions = rank_movie_recommendations_batch(
+                components,
+                [str(item["prompt"]) for item in pending],
+                ranking_config,
+                [item["history_movie_ids"] for item in pending],  # type: ignore[list-item]
+                [item["candidate_movie_ids"] for item in pending],  # type: ignore[list-item]
+            )
             for item, prediction in zip(pending, predictions, strict=True):
                 target_movie_id = str(item["target_movie_id"])
                 ranked = prediction["predicted_movie_ids"]
@@ -154,13 +126,14 @@ def main() -> None:
             pending.clear()
 
         processed_users = 0
-        for user_id, user_ratings in tqdm(grouped, desc="leave-one-out movie token eval"):
+        for uid, user_ratings in tqdm(grouped, desc="leave-one-out movie token eval"):
             if args.max_users is not None and processed_users >= args.max_users:
                 break
             records = user_ratings.to_dict("records")
             if len(records) <= args.min_history:
                 continue
             processed_users += 1
+            user_id = clean_value(uid)
             for split, target_pos, history, target in loo_targets(records, args.min_history, args.max_history):
                 if split != "test":
                     continue
@@ -172,7 +145,6 @@ def main() -> None:
                         raise ValueError(f"User {user_id} has only {len(pool)} available negatives; need {args.candidate_negatives}.")
                     candidate_movie_ids = [target_movie_id] + rng.sample(pool, args.candidate_negatives)
                     rng.shuffle(candidate_movie_ids)
-                prompt = build_recommendation_prompt(users.get(user_id), history, movie_features, candidate_movie_ids)
                 pending.append(
                     {
                         "user_id": user_id,
@@ -181,7 +153,7 @@ def main() -> None:
                         "target_movie_id": target_movie_id,
                         "target_movie_token": movie_features.token(target_movie_id),
                         "target_movie_title": movie_features.title(target_movie_id),
-                        "prompt": prompt,
+                        "prompt": build_recommendation_prompt(user_id, history, movie_features),
                         "history_movie_ids": {clean_value(event["movie_id"]) for event in history},
                         "candidate_movie_ids": candidate_movie_ids,
                     }
@@ -208,8 +180,7 @@ def main() -> None:
         "candidate_negatives": args.candidate_negatives,
         "reranker_score_path": str(args.reranker_score_path) if args.reranker_score_path is not None else None,
         "eval_protocol": "candidate" if args.candidate_negatives > 0 else "full_ranking",
-        "score_mode": args.score_mode,
-        "generation_max_new_tokens": args.generation_max_new_tokens,
+        "score_mode": "first_token",
     }
     save_json(args.output_dir / "leave_one_out_metrics.json", normalized)
     print(json.dumps(normalized, indent=2, ensure_ascii=False))
